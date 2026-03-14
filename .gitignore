@@ -1,0 +1,52 @@
+# User config and credentials
+config.json
+~/.linkedin_autoapply/
+
+# Data artifacts
+auto_apply/data/
+data/
+cache/
+outputs/
+*.db
+*.sqlite
+*.csv
+*.pdf
+*.xlsx
+*.docx
+*.rtfd
+Clean 3rd Party Data/
+
+# Test cache
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Editor
+.idea/
+.vscode/
+
+# Unrelated projects (not part of linkedin-autoapply)
+scraper/
+streamlit_app/
+SCRAPER_GUIDE.md
+IMPLEMENTATION_PLAN.md

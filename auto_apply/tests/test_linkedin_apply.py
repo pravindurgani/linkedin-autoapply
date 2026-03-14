@@ -10,6 +10,8 @@ _FULL_CONFIG = {
     "applicant_name": "Jane Smith",
     "applicant_email": "jane@example.com",
     "applicant_phone": "+44123456789",
+    "min_salary": 85000,
+    "location": "London, UK",
 }
 
 
@@ -61,7 +63,7 @@ def test_try_quick_answer_matches_years_experience_pattern(monkeypatch):
 def test_try_quick_answer_matches_salary_pattern(monkeypatch):
     monkeypatch.setattr(_la, "_QUICK_ANSWERS", _build_quick_answers(_FULL_CONFIG))
     result = _try_quick_answer("What are your salary expectations?")
-    assert result is not None
+    assert result == "85000"
 
 
 def test_try_quick_answer_returns_none_for_unrecognised_question(monkeypatch):
@@ -83,3 +85,29 @@ def test_try_quick_answer_returns_none_when_option_not_matched(monkeypatch):
     result = _try_quick_answer("What is your notice period?", options=["Immediate", "2 weeks"])
     # May or may not match depending on option text — we just verify no crash
     assert result is None or isinstance(result, str)
+
+
+def test_build_quick_answers_uses_salary_from_config():
+    """Salary answer reflects min_salary from config, not a hardcoded value."""
+    answers = _build_quick_answers({**_FULL_CONFIG, "min_salary": 120000})
+    assert any("120000" in str(v) for v in answers.values())
+
+
+def test_build_quick_answers_uses_location_from_config():
+    """Location answer reflects config location, not a hardcoded city."""
+    answers = _build_quick_answers({**_FULL_CONFIG, "location": "Manchester, UK"})
+    assert any("Manchester" in str(v) for v in answers.values())
+
+
+def test_build_quick_answers_omits_salary_when_not_in_config():
+    """When min_salary is absent, salary pattern is not in dict — Claude answers instead."""
+    config = {k: v for k, v in _FULL_CONFIG.items() if k != "min_salary"}
+    answers = _build_quick_answers(config)
+    assert not any("salary" in k for k in answers.keys())
+
+
+def test_build_quick_answers_omits_location_when_not_in_config():
+    """When location is absent, location pattern is not in dict — Claude answers instead."""
+    config = {k: v for k, v in _FULL_CONFIG.items() if k != "location"}
+    answers = _build_quick_answers(config)
+    assert not any("city" in k for k in answers.keys())

@@ -10,7 +10,10 @@ from auto_apply.models import (
 )
 
 
-def _get_conn() -> sqlite3.Connection:
+_db_initialized: bool = False
+
+
+def _raw_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -18,9 +21,16 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-def init_db():
-    """Create tables if they don't exist."""
-    conn = _get_conn()
+def _get_conn() -> sqlite3.Connection:
+    if not _db_initialized:
+        init_db()
+    return _raw_conn()
+
+
+def init_db() -> None:
+    """Create tables if they don't exist. Called automatically on first DB access."""
+    global _db_initialized
+    conn = _raw_conn()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,6 +78,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    _db_initialized = True
 
 
 def upsert_job(job: Job) -> int:
@@ -208,5 +219,3 @@ def get_stats() -> dict:
     return stats
 
 
-# Auto-init on import
-init_db()

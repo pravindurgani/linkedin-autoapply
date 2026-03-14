@@ -165,8 +165,10 @@ def _build_quick_answers(config: dict) -> dict:
     last = name.split()[-1] if name and len(name.split()) > 1 else ""
     email = config.get("applicant_email", "")
     phone = config.get("applicant_phone", "")
+    min_salary = config.get("min_salary", 0)
+    location = config.get("location", "")
 
-    return {
+    answers: dict = {
         # Years of experience patterns
         r"year.*experience.*analytic": "5",
         r"year.*experience.*data": "5",
@@ -194,13 +196,11 @@ def _build_quick_answers(config: dict) -> dict:
         r"year.*experience": "5",
         r"how.many.year": "5",
 
-        # Salary / employment
-        r"salary|compensation|pay.*expect": "90000",
+        # Employment
         r"notice.?period": "1 month",
         r"start.?date|when.*start|earliest.*start": "Immediately",
 
-        # Location
-        r"city|location|where.*based|where.*live": "London, UK",
+        # Location-adjacent yes/no (not location field itself)
         r"willing.*relocate": "Yes",
         r"right.to.work|authorized.*work|eligible.*work|visa|sponsorship": "Yes",
         r"work.*permit|legally.*work": "Yes",
@@ -222,6 +222,15 @@ def _build_quick_answers(config: dict) -> dict:
         r"phone|telephone|mobile|contact.number": phone,
         r"summary|about.*you|cover.*letter|message|introduction": "",
     }
+
+    # Salary and location come from runtime config — omit if not set so Claude
+    # handles these questions instead of returning a wrong hardcoded value.
+    if min_salary:
+        answers[r"salary|compensation|pay.*expect"] = str(int(min_salary))
+    if location:
+        answers[r"city|location|where.*based|where.*live"] = location
+
+    return answers
 
 
 def configure(api_key: str, config: dict, visible: bool = False) -> None:

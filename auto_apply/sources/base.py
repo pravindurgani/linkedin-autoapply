@@ -13,6 +13,6 @@ class BaseJobSource(ABC):
         ...
 
     @abstractmethod
-    async def scrape(self, search_terms: list[str], location: str, min_salary: int) -> list[Job]:
+    async def scrape(self, search_terms: list[str], location: str, min_salary: int, visible: bool = False) -> list[Job]:
         """Scrape jobs matching criteria. Returns list of Job objects."""
         ...

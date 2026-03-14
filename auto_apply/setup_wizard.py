@@ -11,7 +11,7 @@ import anthropic
 import keyring
 import pdfplumber
 
-from auto_apply.config import CONFIG_DIR, CONFIG_PATH
+from auto_apply.config import CONFIG_DIR, CONFIG_PATH, TITLE_MUST_CONTAIN, TITLE_EXCLUDE
 
 
 def _validate_claude_api_key(key: str) -> tuple[bool, str]:
@@ -241,6 +241,9 @@ def _run_wizard_prompts() -> dict:
         "applicant_name": applicant_name,
         "applicant_email": applicant_email,
         "applicant_phone": applicant_phone,
+        # Title filters — edit ~/.linkedin_autoapply/config.json to customise
+        "title_must_contain": TITLE_MUST_CONTAIN,
+        "title_exclude": TITLE_EXCLUDE,
     }
 
     # Summary

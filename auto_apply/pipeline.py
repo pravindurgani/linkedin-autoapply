@@ -21,12 +21,12 @@ from auto_apply.cv_parser import extract_cv_text
 log = logging.getLogger(__name__)
 
 
-def _title_passes_filter(title: str) -> bool:
-    """Check if a job title matches our criteria."""
+def _title_passes_filter(title: str, must_contain: list[str], exclude: list[str]) -> bool:
+    """Check if a job title matches the configured keyword criteria."""
     t = title.lower()
-    if not any(kw in t for kw in TITLE_MUST_CONTAIN):
+    if must_contain and not any(kw in t for kw in must_contain):
         return False
-    if any(ex in t for ex in TITLE_EXCLUDE):
+    if any(ex in t for ex in exclude):
         return False
     return True
 
@@ -57,6 +57,8 @@ async def run_scrape(config: dict, visible: bool = False) -> int:
     search_titles = config["job_titles"]
     location = config["location"]
     min_salary = int(config.get("min_salary", 0))
+    must_contain = config.get("title_must_contain", TITLE_MUST_CONTAIN)
+    title_exclude = config.get("title_exclude", TITLE_EXCLUDE)
 
     log.info(f"=== SCRAPING: {len(search_titles)} search terms ===")
     source = LinkedInSource()
@@ -65,7 +67,8 @@ async def run_scrape(config: dict, visible: bool = False) -> int:
 
     filtered = [
         j for j in jobs
-        if _title_passes_filter(j.title) and _salary_passes_filter(j, min_salary)
+        if _title_passes_filter(j.title, must_contain, title_exclude)
+        and _salary_passes_filter(j, min_salary)
     ]
     log.info(f"  After filter: {len(filtered)}")
 

@@ -92,6 +92,7 @@ Install it now? (recommended) [y/n]: y
 
 | Command | Description |
 |---------|-------------|
+| `linkedin-autoapply` | Run full pipeline — same as `linkedin-autoapply run` |
 | `linkedin-autoapply run` | Run full pipeline (scrape → score → apply → export) |
 | `linkedin-autoapply run --skip-cv-review` | Skip the Claude CV review before applying |
 | `linkedin-autoapply run --dry-run` | Scrape and score, no applications submitted |
@@ -138,3 +139,14 @@ All config is stored at `~/.linkedin_autoapply/` (your home directory):
 ```
 
 Your LinkedIn password is **not** stored in `config.json`. It is stored in your system keychain (macOS Keychain / Linux Secret Service / Windows Credential Manager) via the `keyring` library.
+
+### Customising the title filter
+
+`config.json` contains two lists you can edit directly to change which job titles are considered:
+
+```json
+"title_must_contain": ["data", "analytics", "machine learning", ...],
+"title_exclude":      ["intern", "director", "contract", ...]
+```
+
+Set `title_must_contain` to `[]` to disable the keyword requirement and include all scraped titles. The defaults are tuned for data/analytics roles — adjust for your field.

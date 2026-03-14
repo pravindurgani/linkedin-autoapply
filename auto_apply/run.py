@@ -28,11 +28,14 @@ def setup_logging(verbose: bool = False):
     logging.getLogger("playwright").setLevel(logging.WARNING)
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
-def cli(verbose):
+@click.pass_context
+def cli(ctx, verbose):
     """linkedin-autoapply — scrape, score, and apply to jobs on LinkedIn."""
     setup_logging(verbose)
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(run)
 
 
 @cli.command()

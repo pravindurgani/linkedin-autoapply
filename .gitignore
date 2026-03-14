@@ -22,7 +22,6 @@ Clean 3rd Party Data/
 # Environment
 .env
 .env.*
-!.env.example
 
 # Python
 __pycache__/

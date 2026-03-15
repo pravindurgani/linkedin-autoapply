@@ -115,7 +115,7 @@ Question: {question}
             for opt in options:
                 if opt.lower() in ("yes", "true"):
                     return opt
-            return options[1] if len(options) > 1 else options[0]
+            return options[0]
         if field_type == "numeric":
             return "5"
         return "Yes"

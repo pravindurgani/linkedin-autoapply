@@ -75,13 +75,13 @@ async def run_scrape(config: dict, visible: bool = False, password: str | None =
     ]
     log.info(f"  After filter: {len(filtered)}")
 
-    new_count = 0
+    stored_count = 0
     for job in filtered:
         store.upsert_job(job)
-        new_count += 1
+        stored_count += 1
 
-    log.info(f"=== SCRAPE COMPLETE: {new_count} jobs stored ===")
-    return new_count
+    log.info(f"=== SCRAPE COMPLETE: {stored_count} jobs stored ===")
+    return stored_count
 
 
 async def run_match(api_key: str, cv_text: str) -> int:

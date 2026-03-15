@@ -6,6 +6,7 @@ import logging
 import random
 import re
 from pathlib import Path
+from urllib.parse import quote
 from playwright.async_api import async_playwright, Page, BrowserContext
 from auto_apply.config import (
     HEADLESS, BROWSER_TIMEOUT, RATE_LIMIT_LINKEDIN, CONFIG_DIR,
@@ -128,7 +129,7 @@ class LinkedInSource(BaseJobSource):
             start = page_num * 25
             url = (
                 f"https://www.linkedin.com/jobs/search/"
-                f"?keywords={keywords.replace(' ', '%20')}"
+                f"?keywords={quote(keywords)}"
                 f"&location={location}"
                 f"&f_SB2={salary_filter}"
                 f"&f_WT=2"  # On-site and hybrid

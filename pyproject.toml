@@ -26,3 +26,6 @@ linkedin-autoapply = "auto_apply.run:cli"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["auto_apply*"]
+
+[tool.pytest.ini_options]
+testpaths = ["auto_apply/tests"]

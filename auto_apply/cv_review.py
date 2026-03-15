@@ -1,9 +1,13 @@
 """CV review step using Claude API before applications begin."""
 
+import logging
+
 import anthropic
 
 from auto_apply.config import CLAUDE_MODEL_CV_REVIEW
 from auto_apply.cv_parser import extract_cv_text
+
+log = logging.getLogger(__name__)
 
 
 def build_cv_review_prompt(cv_text: str, job_titles: list[str]) -> str:
@@ -50,11 +54,18 @@ def run_cv_review(api_key: str, cv_path: str, job_titles: list[str]) -> bool:
     prompt = build_cv_review_prompt(cv_text, job_titles)
 
     client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=CLAUDE_MODEL_CV_REVIEW,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL_CV_REVIEW,
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        log.error(f"CV review API call failed (cv_path={cv_path}): {e}")
+        print(f"\nCV review failed: {e}")
+        print("Tip: re-run with --skip-cv-review to bypass this step.")
+        answer = input("Continue without CV review? [y/n]: ").strip().lower()
+        return answer == "y"
 
     print("\n" + "=" * 60)
     print("  CV REVIEW")

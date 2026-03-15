@@ -84,21 +84,26 @@ def test_score_job_clamps_score_below_0():
     assert result.score == 0
 
 
-def test_score_job_returns_zero_on_unexpected_error():
-    """score_job returns score 0 and includes error detail when API raises."""
+def test_score_job_returns_none_on_unexpected_error():
+    """score_job returns None (not a MatchResult) when the API raises unexpectedly.
+    None signals a transient failure — the job is not written to match_scores
+    and will be retried on the next run (Bug 5 fix).
+    """
     with patch("auto_apply.matcher._get_client") as mock_get_client:
         mock_get_client.return_value.messages.create.side_effect = Exception("unexpected API error")
         result = score_job(1, "Analyst", "Corp", "desc", "£50k", "cv", "sk-ant-test")
 
-    assert result.score == 0
-    assert "Scoring failed" in result.reasoning
+    assert result is None
 
 
-def test_score_job_returns_zero_on_malformed_json():
-    """score_job returns score 0 when Claude returns non-JSON text."""
+def test_score_job_returns_none_on_malformed_json():
+    """score_job returns None when Claude returns non-JSON text.
+    None signals a transient failure — the job is not written to match_scores
+    and will be retried on the next run (Bug 5 fix).
+    """
     mock_text = "Sorry, I cannot score this job right now."
     with patch("auto_apply.matcher._get_client") as mock_get_client:
         mock_get_client.return_value.messages.create.return_value = _make_mock_response(mock_text)
         result = score_job(1, "Analyst", "Corp", "desc", "£50k", "cv", "sk-ant-test")
 
-    assert result.score == 0
+    assert result is None

@@ -3,13 +3,14 @@
 import json
 from pathlib import Path
 
-# ── Paths ──
-BASE_DIR = Path(__file__).resolve().parent
-
 # ── User config directory ──
 CONFIG_DIR = Path.home() / ".linkedin_autoapply"
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = CONFIG_DIR / "config.json"
+
+
+def ensure_config_dir() -> None:
+    """Create CONFIG_DIR if it does not exist. Call before any file I/O under CONFIG_DIR."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = CONFIG_DIR / "jobs.db"
 CV_CACHE_PATH = CONFIG_DIR / "cv_text.txt"
@@ -45,6 +46,7 @@ BROWSER_TIMEOUT = 30_000  # ms
 
 def load_config() -> dict:
     """Load user config from CONFIG_PATH. Returns empty dict if not found."""
+    ensure_config_dir()
     if not CONFIG_PATH.exists():
         return {}
     try:

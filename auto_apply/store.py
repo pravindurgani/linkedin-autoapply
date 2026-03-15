@@ -90,10 +90,11 @@ def upsert_job(job: Job) -> int:
            easy_apply, scraped_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(source, external_id) DO UPDATE SET
-             title=excluded.title, salary_min=excluded.salary_min,
+             title=excluded.title, company=excluded.company,
+             location=excluded.location, salary_min=excluded.salary_min,
              salary_max=excluded.salary_max, salary_text=excluded.salary_text,
-             description=excluded.description, easy_apply=excluded.easy_apply,
-             scraped_at=excluded.scraped_at
+             description=excluded.description, url=excluded.url,
+             easy_apply=excluded.easy_apply, scraped_at=excluded.scraped_at
         """,
         (job.title, job.company, job.location, job.salary_min, job.salary_max,
          job.salary_text, job.description, job.url, job.source.value,
@@ -105,6 +106,10 @@ def upsert_job(job: Job) -> int:
         "SELECT id FROM jobs WHERE source=? AND external_id=?",
         (job.source.value, job.external_id),
     ).fetchone()
+    conn.execute(
+        "DELETE FROM match_scores WHERE job_id = ?",
+        (row["id"],),
+    )
     conn.commit()
     conn.close()
     return row["id"]

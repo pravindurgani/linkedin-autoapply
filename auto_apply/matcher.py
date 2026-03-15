@@ -56,15 +56,17 @@ def score_job(
     salary_text: str,
     cv_text: str,
     api_key: str,
-) -> MatchResult:
+) -> MatchResult | None:
     """Score a job against the CV using Claude Haiku.
 
     Args:
         job_id: Database ID of the job.
         title: Job title.
         company: Company name.
-        description: Full job description text.
-        salary_text: Human-readable salary string.
+        description: Full job description text. Currently always "" (descriptions not scraped
+            at card level — see sources/linkedin.py note). Scoring is title+company only.
+        salary_text: Human-readable salary string. Currently always None (not parsed from
+            cards).
         cv_text: Extracted CV text (first 3000 chars used).
         api_key: Anthropic API key.
 
@@ -119,13 +121,13 @@ Score this match as JSON."""
             continue
         except anthropic.APIError as e:
             log.error(f"Claude API error scoring job {job_id} ({title}): {e}")
-            return MatchResult(job_id=job_id, score=0, reasoning=f"Scoring failed: {e}")
+            return None
         except Exception as e:
             log.error(f"Scoring failed for job {job_id} ({title}): {e}")
-            return MatchResult(job_id=job_id, score=0, reasoning=f"Scoring failed: {e}")
+            return None
 
     log.error(f"All retries exhausted for job {job_id} ({title})")
-    return MatchResult(job_id=job_id, score=0, reasoning="Scoring failed: rate limit retries exhausted")
+    return None
 
 
 def score_jobs_batch(jobs: list[dict], api_key: str, cv_text: str) -> list[MatchResult]:
@@ -153,6 +155,9 @@ def score_jobs_batch(jobs: list[dict], api_key: str, cv_text: str) -> list[Match
             cv_text=cv_text,
             api_key=api_key,
         )
+        if result is None:
+            log.warning(f"  Skipping record for job {job['id']} ({job['title'][:50]}) — scoring failed, will retry next run")
+            continue
         log.info(f"  Score: {result.score}/100 — {result.reasoning[:80]}")
         results.append(result)
 

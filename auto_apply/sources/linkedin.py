@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext
@@ -71,7 +72,7 @@ class LinkedInSource(BaseJobSource):
                             all_jobs.append(j)
                 except Exception as e:
                     log.error(f"LinkedIn search failed for '{term}': {e}")
-                await asyncio.sleep(RATE_LIMIT_LINKEDIN)
+                await asyncio.sleep(random.uniform(8, 15))
 
             # Save cookies for next run
             cookies = await context.cookies()
@@ -181,31 +182,33 @@ class LinkedInSource(BaseJobSource):
             data_id = await card.get_attribute("data-job-id") or ""
             external_id = data_id or title[:50]
 
+        if not url and external_id and external_id.isdigit():
+            url = f"https://www.linkedin.com/jobs/view/{external_id}/"
+
+        if not url or not external_id:
+            log.debug(f"Skipping card with no URL and no external_id (title='{title[:50]}')")
+            return None
+
         # Company
         company_el = await card.query_selector('.job-card-container__primary-description, [class*="company"]')
-        company = (await company_el.inner_text()).strip() if company_el else "Unknown"
+        if company_el:
+            company = (await company_el.inner_text()).strip()
+        else:
+            company = "Unknown"
+            log.warning(f"Could not extract company for job '{title[:50]}' — defaulting to 'Unknown'")
 
         # Location
         loc_el = await card.query_selector('.job-card-container__metadata-item, [class*="location"]')
         location = (await loc_el.inner_text()).strip() if loc_el else "London"
 
-        # Easy Apply badge — check multiple selectors and also page text
-        easy_apply = False
-        for sel in [
-            '[class*="easy-apply"]',
-            '.job-card-container__apply-method',
-            'li-icon[type="jobs-easy-apply-icon"]',
-            'span.job-card-container__footer-item',
-        ]:
-            easy_el = await card.query_selector(sel)
-            if easy_el:
-                txt = (await easy_el.inner_text()).strip().lower()
-                if "easy apply" in txt or "easyapply" in txt:
-                    easy_apply = True
-                    break
-        # If we filtered by f_AL=true, all results are Easy Apply
-        if not easy_apply:
-            easy_apply = True  # f_AL=true filter guarantees Easy Apply
+        # NOTE: Job description is not extracted at card-scrape time.
+        # LinkedIn list pages do not expose full descriptions in card DOM.
+        # Fetching descriptions requires a separate page.goto() per job (detail-page scrape).
+        # See Step 9.4 architectural note in IMPLEMENTATION_PLAN.md for the session-reuse
+        # prerequisite that makes detail-page scraping practical.
+        # Scores are currently based on title + company only (description="", salary_text=None).
+
+        easy_apply = True  # f_AL=true URL filter guarantees all results are Easy Apply
 
         if not title:
             return None

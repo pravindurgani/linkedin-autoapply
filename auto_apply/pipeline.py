@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 from datetime import datetime
 
 import pandas as pd
@@ -40,18 +41,20 @@ def _salary_passes_filter(job: Job, min_salary: int) -> bool:
     return True
 
 
-async def run_scrape(config: dict, visible: bool = False) -> int:
+async def run_scrape(config: dict, visible: bool = False, password: str | None = None) -> int:
     """Scrape LinkedIn and store jobs. Returns count of new jobs.
 
     Args:
         config: User config dict from config.json.
         visible: If True, run browser in visible mode.
+        password: LinkedIn password. If None, fetched from keychain/setup wizard.
     """
     from auto_apply.setup_wizard import _get_linkedin_password
     from auto_apply.sources.linkedin import configure as configure_source
 
     email = config["linkedin_email"]
-    password = _get_linkedin_password(email)
+    if password is None:
+        password = _get_linkedin_password(email)
     configure_source(email=email, password=password, visible=visible)
 
     search_titles = config["job_titles"]
@@ -104,12 +107,19 @@ async def run_match(api_key: str, cv_text: str) -> int:
     return len(results)
 
 
-async def run_apply() -> int:
+async def run_apply(max_applies: int = 15) -> int:
     """Apply to unapplied jobs above threshold. Returns count applied."""
+    if max_applies <= 0:
+        raise ValueError(f"max_applies must be a positive integer, got {max_applies}")
+
     candidates = store.get_unapplied_matches(SCORE_THRESHOLD)
     if not candidates:
         log.info("No unapplied matches to apply for.")
         return 0
+
+    if len(candidates) > max_applies:
+        log.info(f"Capping at {max_applies} attempts (found {len(candidates)} candidates). Run again to continue.")
+        candidates = candidates[:max_applies]
 
     log.info(f"=== APPLYING: {len(candidates)} jobs to apply for ===")
     applied_count = 0
@@ -151,6 +161,9 @@ async def run_apply() -> int:
                     error_message=str(e)[:500],
                 ))
                 log.error(f"  ERROR: {e}")
+            delay = random.uniform(45, 90)
+            log.info(f"  Waiting {delay:.0f}s before next application...")
+            await asyncio.sleep(delay)
         else:
             store.record_application(Application(
                 job_id=job_id,
@@ -159,8 +172,6 @@ async def run_apply() -> int:
                 error_message="Not an Easy Apply job",
             ))
             log.info("  SKIPPED: Not an Easy Apply job")
-
-        await asyncio.sleep(2)
 
     log.info(f"\n=== APPLY COMPLETE: {applied_count}/{len(candidates)} applied ===")
     return applied_count
@@ -200,6 +211,7 @@ async def run_full_pipeline(
     skip_cv_review: bool = False,
     dry_run: bool = False,
     visible: bool = False,
+    max_applies: int = 15,
 ) -> None:
     """Run the full linkedin-autoapply pipeline.
 
@@ -231,12 +243,12 @@ async def run_full_pipeline(
             return
 
     # 3. Configure modules with runtime credentials
-    configure_applier(api_key=api_key, config=config, visible=visible)
     password = _get_linkedin_password(config["linkedin_email"])
+    configure_applier(api_key=api_key, config=config, visible=visible, password=password)
     configure_source(email=config["linkedin_email"], password=password, visible=visible)
 
     # 4. Scrape
-    await run_scrape(config, visible=visible)
+    await run_scrape(config, visible=visible, password=password)
 
     # 5. Score
     cv_text = extract_cv_text()
@@ -246,7 +258,7 @@ async def run_full_pipeline(
     if dry_run:
         log.info("--dry-run: skipping application submission")
     else:
-        await run_apply()
+        await run_apply(max_applies=max_applies)
 
     # 7. Report
     run_export()

@@ -233,13 +233,14 @@ def _build_quick_answers(config: dict) -> dict:
     return answers
 
 
-def configure(api_key: str, config: dict, visible: bool = False) -> None:
+def configure(api_key: str, config: dict, visible: bool = False, password: str | None = None) -> None:
     """Configure the applier with runtime credentials and settings.
 
     Args:
         api_key: Anthropic API key for Claude.
         config: Full user config dict from config.json.
         visible: If True, run browser in visible mode (overrides HEADLESS).
+        password: LinkedIn password. If None, fetched from keychain/setup wizard.
     """
     global _api_key, _visible, _linkedin_email, _linkedin_password, _cv_path
     global _QUICK_ANSWERS, _claude_client, _cv_text
@@ -250,8 +251,11 @@ def configure(api_key: str, config: dict, visible: bool = False) -> None:
     _QUICK_ANSWERS = _build_quick_answers(config)
     _claude_client = None  # Reset when API key changes
     _cv_text = None        # Reset cache when config changes
-    from auto_apply.setup_wizard import _get_linkedin_password
-    _linkedin_password = _get_linkedin_password(_linkedin_email)
+    if password is not None:
+        _linkedin_password = password
+    else:
+        from auto_apply.setup_wizard import _get_linkedin_password
+        _linkedin_password = _get_linkedin_password(_linkedin_email)
 
 
 def answer_question(question: str, options: list[str] | None = None,
@@ -277,6 +281,15 @@ def answer_question(question: str, options: list[str] | None = None,
 class LinkedInApplier(BaseApplier):
     name = "linkedin"
 
+    # ARCHITECTURE NOTE (Phase 10):
+    # Each apply() call launches a fresh Playwright browser instance.
+    # This is safe (isolated failures) but observable by LinkedIn's bot detection
+    # when multiple applications are submitted in sequence from the same IP.
+    # Phase 10 improvement: accept an optional pre-authenticated Page/Context
+    # and reuse the scraper's existing browser session. This would also allow
+    # description scraping (Phase 10 Gap 3 fix) to share the session.
+    # Until Phase 10: the per-apply delay in pipeline.py (Step 9.1) is the
+    # primary mitigation for session-frequency detection.
     async def apply(self, job: dict) -> tuple[bool, str]:
         if not _linkedin_email or not _linkedin_password:
             return False, "LinkedIn credentials not configured — run linkedin-autoapply setup"

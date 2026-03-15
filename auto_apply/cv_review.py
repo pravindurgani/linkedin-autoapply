@@ -60,6 +60,12 @@ def run_cv_review(api_key: str, cv_path: str, job_titles: list[str]) -> bool:
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
+    except anthropic.AuthenticationError as e:
+        log.error(f"CV review authentication failed (cv_path={cv_path}): {e}")
+        print(f"\nCV review failed: invalid API key — check your claude_api_key in config.")
+        print("Tip: re-run with --skip-cv-review to bypass this step.")
+        answer = input("Continue without CV review? [y/n]: ").strip().lower()
+        return answer == "y"
     except Exception as e:
         log.error(f"CV review API call failed (cv_path={cv_path}): {e}")
         print(f"\nCV review failed: {e}")

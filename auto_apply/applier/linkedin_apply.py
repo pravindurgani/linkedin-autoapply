@@ -108,9 +108,8 @@ Question: {question}
 
         return answer
 
-    except Exception as e:
-        log.warning(f"Claude screening answer failed: {e}")
-        # Fallback defaults
+    except anthropic.APIError as e:
+        log.warning(f"Claude screening answer failed (API error): {e}")
         if options:
             for opt in options:
                 if opt.lower() in ("yes", "true"):
@@ -118,7 +117,17 @@ Question: {question}
             return options[0]
         if field_type == "numeric":
             return "5"
-        return "Yes"
+        return ""
+    except Exception as e:
+        log.warning(f"Claude screening answer failed: {e}")
+        if options:
+            for opt in options:
+                if opt.lower() in ("yes", "true"):
+                    return opt
+            return options[0]
+        if field_type == "numeric":
+            return "5"
+        return ""
 
 
 # ── Rule-based quick answers (populated via configure()) ──
@@ -261,8 +270,10 @@ def configure(api_key: str, config: dict, visible: bool = False, password: str |
 def answer_question(question: str, options: list[str] | None = None,
                     job_title: str = "", field_type: str = "text") -> str:
     """Answer a screening question — rules first, Claude as fallback."""
-    # Skip non-English questions that are just UI labels (Bengali navigation text)
-    # These are LinkedIn UI elements, not actual screening questions
+    # Skip Bengali-locale UI label strings that LinkedIn injects as question text.
+    # "নির্বাচন" = select, "আপলোড" = upload, "চিহ্নিত" = marked.
+    # These are navigation/widget labels, not actual screening questions.
+    # Workaround for LinkedIn serving mixed-locale UI on some accounts.
     q_lower = question.lower()
     if any(skip in q_lower for skip in ["নির্বাচন", "আপলোড", "চিহ্নিত"]):
         return ""
@@ -406,8 +417,8 @@ class LinkedInApplier(BaseApplier):
                     if file_input:
                         await file_input.set_input_files(_cv_path)
                         await asyncio.sleep(1)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"CV upload failed: {e}")
 
             # Check checkboxes (like "top choice")
             await page.evaluate('''() => {

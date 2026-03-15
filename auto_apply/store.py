@@ -119,6 +119,11 @@ def upsert_job(job: Job) -> int:
             "SELECT id FROM jobs WHERE source=? AND external_id=?",
             (job.source.value, job.external_id),
         ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"upsert_job: no row found after insert for "
+                f"source={job.source.value!r} external_id={job.external_id!r}"
+            )
         if cur.rowcount > 0:
             conn.execute(
                 "DELETE FROM match_scores WHERE job_id = ?",

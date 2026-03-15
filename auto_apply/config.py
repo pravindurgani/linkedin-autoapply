@@ -1,7 +1,10 @@
 """Configuration — runtime constants and config loader."""
 
 import json
+import logging
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # ── User config directory ──
 CONFIG_DIR = Path.home() / ".linkedin_autoapply"
@@ -52,7 +55,8 @@ def load_config() -> dict:
     try:
         with open(CONFIG_PATH) as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        log.debug("Config load failed: %s", e)
         return {}
 
 
@@ -62,7 +66,8 @@ def config_exists() -> bool:
         return False
     try:
         return bool(load_config())
-    except Exception:
+    except Exception as e:
+        log.debug("Config exists check failed: %s", e)
         return False
 
 

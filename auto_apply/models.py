@@ -65,3 +65,5 @@ class Application(BaseModel):
     method: ApplyMethod = ApplyMethod.NONE
     applied_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    screenshot_path: Optional[str] = None
+    failure_url: Optional[str] = None

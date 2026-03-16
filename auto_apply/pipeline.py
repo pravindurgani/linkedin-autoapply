@@ -18,6 +18,7 @@ from auto_apply.matcher import score_jobs_batch
 from auto_apply.sources.linkedin import LinkedInSource
 from auto_apply.applier.linkedin_apply import LinkedInApplier
 from auto_apply.cv_parser import extract_cv_text
+from playwright.async_api import BrowserContext
 
 log = logging.getLogger(__name__)
 
@@ -41,13 +42,20 @@ def _salary_passes_filter(job: Job, min_salary: int) -> bool:
     return True
 
 
-async def run_scrape(config: dict, visible: bool = False, password: str | None = None) -> int:
+async def run_scrape(
+    config: dict,
+    visible: bool = False,
+    password: str | None = None,
+    context: BrowserContext | None = None,
+) -> int:
     """Scrape LinkedIn and store jobs. Returns count of new jobs.
 
     Args:
         config: User config dict from config.json.
         visible: If True, run browser in visible mode.
         password: LinkedIn password. If None, fetched from keychain/setup wizard.
+        context: Shared BrowserContext from linkedin_session(). If provided,
+            passed through to LinkedInSource.scrape() for session reuse.
     """
     from auto_apply.setup_wizard import _get_linkedin_password
     from auto_apply.sources.linkedin import configure as configure_source
@@ -65,7 +73,7 @@ async def run_scrape(config: dict, visible: bool = False, password: str | None =
 
     log.info(f"=== SCRAPING: {len(search_titles)} search terms ===")
     source = LinkedInSource()
-    jobs = await source.scrape(search_titles, location, min_salary, visible=visible)
+    jobs = await source.scrape(search_titles, location, min_salary, visible=visible, context=context)
     log.info(f"  Raw results: {len(jobs)}")
 
     filtered = [
@@ -81,6 +89,31 @@ async def run_scrape(config: dict, visible: bool = False, password: str | None =
         stored_count += 1
 
     log.info(f"=== SCRAPE COMPLETE: {stored_count} jobs stored ===")
+
+    # Phase 10.5 — post-scrape location validation.
+    # LinkedIn silently expands geography when a salary-filtered search returns
+    # too few results (e.g. searching Manchester at £80k+ returns London jobs).
+    # Compare distinct scraped locations against the searched location and emit
+    # a structured WARNING when mismatches are found. Does not abort the pipeline.
+    if stored_count > 0:
+        scraped_locations = store.get_distinct_locations()
+        if scraped_locations:
+            # Match on city name only — "Manchester" should accept "Greater Manchester,
+            # England" and "Manchester Area, UK" without false-positive mismatches.
+            city = location.split(",")[0].strip().lower()
+            mismatches = [loc for loc in scraped_locations if city not in loc.lower()]
+            if mismatches:
+                match_count = len(scraped_locations) - len(mismatches)
+                match_rate = match_count / len(scraped_locations) * 100
+                log.warning(
+                    f"Location mismatch: searched '{location}' but "
+                    f"{len(mismatches)}/{len(scraped_locations)} scraped locations "
+                    f"do not match (match rate {match_rate:.0f}%). "
+                    f"Non-matching locations: {mismatches[:5]}. "
+                    f"LinkedIn may have expanded geographically due to sparse "
+                    f"results at the configured salary band."
+                )
+
     return stored_count
 
 
@@ -107,10 +140,34 @@ async def run_match(api_key: str, cv_text: str) -> int:
     return len(results)
 
 
-async def run_apply(max_applies: int = 15) -> int:
-    """Apply to unapplied jobs above threshold. Returns count applied."""
+async def run_apply(
+    max_applies: int = 15,
+    context: BrowserContext | None = None,
+) -> int:
+    """Apply to unapplied jobs above threshold. Returns count applied.
+
+    Args:
+        max_applies: Maximum number of apply attempts this run.
+        context: Shared BrowserContext from linkedin_session(). Each apply()
+            call creates its own Page within this context and closes it on
+            return — a page-level failure does not affect subsequent jobs.
+            If None, apply() uses a standalone browser per application.
+    """
     if max_applies <= 0:
         raise ValueError(f"max_applies must be a positive integer, got {max_applies}")
+
+    # Session health check — verify the shared context is authenticated before
+    # attempting any applications. Aborts early with a clear error rather than
+    # silently failing on every job in the batch.
+    if context is not None:
+        from auto_apply.browser import verify_session
+        if not await verify_session(context):
+            log.error(
+                "Session health check failed — LinkedIn context is not authenticated. "
+                "The scraper may have failed to log in or the session expired. "
+                "Aborting apply phase. Run with --visible to diagnose login issues."
+            )
+            return 0
 
     candidates = store.get_unapplied_matches(SCORE_THRESHOLD)
     if not candidates:
@@ -135,7 +192,7 @@ async def run_apply(max_applies: int = 15) -> int:
 
         if job.get("easy_apply"):
             try:
-                success, message = await applier.apply(job)
+                success, message, screenshot_path, failure_url = await applier.apply(job, context=context)
                 if success:
                     store.record_application(Application(
                         job_id=job_id,
@@ -146,13 +203,33 @@ async def run_apply(max_applies: int = 15) -> int:
                     applied_count += 1
                     log.info(f"  SUCCESS: {message}")
                 else:
+                    # Distinguish permanently-non-applicable jobs (skip) from transient
+                    # failures (fail → retry next run via get_unapplied_matches JOIN fix).
+                    # Skipped messages come from _apply_on_page() stages 1 and 2:
+                    #   "External apply only"  — redirects to company ATS (stage 1)
+                    #   "Connect button found" — job closed / recruiter-only (stage 2)
+                    #   "not Easy Apply"       — easy_apply flag was wrong at DB level
+                    _SKIP_PHRASES = (
+                        "External apply only",
+                        "Connect button found",
+                        "not Easy Apply",
+                    )
+                    if any(phrase in message for phrase in _SKIP_PHRASES):
+                        status = ApplicationStatus.SKIPPED
+                    else:
+                        status = ApplicationStatus.FAILED
                     store.record_application(Application(
                         job_id=job_id,
-                        status=ApplicationStatus.FAILED,
+                        status=status,
                         method=ApplyMethod.EASY_APPLY,
                         error_message=message,
+                        screenshot_path=screenshot_path,
+                        failure_url=failure_url,
                     ))
-                    log.warning(f"  FAILED: {message}")
+                    if status == ApplicationStatus.SKIPPED:
+                        log.info(f"  SKIPPED: {message}")
+                    else:
+                        log.warning(f"  FAILED: {message}")
             except Exception as e:
                 store.record_application(Application(
                     job_id=job_id,
@@ -242,24 +319,31 @@ async def run_full_pipeline(
             print("Exiting. Update your CV and re-run when ready.")
             return
 
-    # 3. Configure modules with runtime credentials
+    # 3. Configure modules with runtime credentials (once, before browser opens)
     password = _get_linkedin_password(config["linkedin_email"])
     configure_applier(api_key=api_key, config=config, visible=visible, password=password)
     configure_source(email=config["linkedin_email"], password=password, visible=visible)
 
-    # 4. Scrape
-    await run_scrape(config, visible=visible, password=password)
+    # 4–6. Run scrape + score + apply inside a single shared browser session.
+    # The scraper authenticates the context once; the applier reuses it for every
+    # application in the batch — preserving localStorage/sessionStorage/IndexedDB
+    # tokens that LinkedIn requires for full authentication.
+    from auto_apply.browser import linkedin_session
 
-    # 5. Score
-    cv_text = extract_cv_text()
-    await run_match(api_key, cv_text)
+    async with linkedin_session(visible=visible) as context:
+        # 4. Scrape
+        await run_scrape(config, visible=visible, password=password, context=context)
 
-    # 6. Apply (unless dry run)
-    if dry_run:
-        log.info("--dry-run: skipping application submission")
-    else:
-        await run_apply(max_applies=max_applies)
+        # 5. Score (no browser needed — pure API calls)
+        cv_text = extract_cv_text()
+        await run_match(api_key, cv_text)
 
-    # 7. Report
+        # 6. Apply (session health check runs inside run_apply before the loop)
+        if dry_run:
+            log.info("--dry-run: skipping application submission")
+        else:
+            await run_apply(max_applies=max_applies, context=context)
+
+    # 7. Report (browser already closed by linkedin_session finally block)
     run_export()
     run_status()

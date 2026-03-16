@@ -39,14 +39,18 @@ def cli(ctx, verbose):
 
 
 @cli.command()
+@click.option("--retry-failed", is_flag=True, help="Clear failed application records before running (re-queues them for retry)")
 @click.option("--skip-cv-review", is_flag=True, help="Skip the Claude CV review step")
 @click.option("--dry-run", is_flag=True, help="Score jobs but do not submit applications")
 @click.option("--visible", is_flag=True, help="Run browser in visible mode (for 2FA/CAPTCHA on first login)")
 @click.option("--max-applies", default=15, show_default=True, help="Maximum applications to attempt per run (each takes ~1 min with safety delays).")
-def run(skip_cv_review, dry_run, visible, max_applies):
+def run(retry_failed, skip_cv_review, dry_run, visible, max_applies):
     """Run the full pipeline: scrape, score, and apply."""
     if max_applies <= 0:
         raise click.UsageError("--max-applies must be a positive integer")
+    if retry_failed:
+        from auto_apply.store import reset_failed_applications
+        reset_failed_applications()
     asyncio.run(run_full_pipeline(
         skip_cv_review=skip_cv_review,
         dry_run=dry_run,

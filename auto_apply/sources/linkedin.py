@@ -8,21 +8,32 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 from playwright.async_api import async_playwright, Page, BrowserContext
-from auto_apply.config import (
-    HEADLESS, BROWSER_TIMEOUT, RATE_LIMIT_LINKEDIN, CONFIG_DIR,
-)
+from auto_apply.config import HEADLESS, BROWSER_TIMEOUT, RATE_LIMIT_LINKEDIN
+from auto_apply.browser import COOKIES_PATH
 from auto_apply.models import Job, JobSource
 from auto_apply.sources.base import BaseJobSource
 
 log = logging.getLogger(__name__)
-
-COOKIES_PATH = CONFIG_DIR / "linkedin_cookies.json"
 MAX_PAGES = 3  # 25 jobs/page
 
 # ── Runtime config (set via configure()) ──
 _linkedin_email: str = ""
 _linkedin_password: str = ""
 _visible: bool = False
+
+# ── Company name selector chain ──
+# Priority-ordered: most specific / most stable anchor first, broadest last.
+# LinkedIn's card DOM class names change with product updates — add new confirmed
+# selectors at the front and keep old ones as fallbacks for accounts still on
+# the previous layout. "Unknown" is only the result if every selector fails.
+_COMPANY_SELECTORS: list[str] = [
+    ".job-card-container__primary-description",        # legacy (pre-2025)
+    ".artdeco-entity-lockup__subtitle span",           # 2024–2025 artdeco layout
+    "[class*='job-card-list__company-name']",          # BEM variant
+    "[class*='job-card-container__company-name']",     # alternative container class
+    "[class*='company-name']",                         # generic company-name class
+    "[data-tracking-control-name*='company']",         # tracking attribute anchor
+]
 
 
 def configure(email: str, password: str, visible: bool = False) -> None:
@@ -42,7 +53,29 @@ def configure(email: str, password: str, visible: bool = False) -> None:
 class LinkedInSource(BaseJobSource):
     name = "linkedin"
 
-    async def scrape(self, search_terms: list[str], location: str, min_salary: int, visible: bool = False) -> list[Job]:
+    async def scrape(
+        self,
+        search_terms: list[str],
+        location: str,
+        min_salary: int,
+        visible: bool = False,
+        context: BrowserContext | None = None,
+    ) -> list[Job]:
+        """Scrape LinkedIn jobs for the given search terms.
+
+        Args:
+            search_terms: List of job title keywords to search.
+            location: LinkedIn location string (e.g. "Manchester, England").
+            min_salary: Minimum salary filter (used for post-scrape filtering).
+            visible: If True, override HEADLESS for this session.
+            context: Shared BrowserContext from linkedin_session(). If provided,
+                the scraper creates one Page within it and closes that page on
+                return — the context is not closed. If None, a standalone browser
+                lifecycle is used (scrape subcommand path).
+
+        Returns:
+            List of Job objects scraped from LinkedIn.
+        """
         if not _linkedin_email or not _linkedin_password:
             raise RuntimeError(
                 "LinkedInSource credentials not set — call configure(email, password) before scrape()"
@@ -52,33 +85,53 @@ class LinkedInSource(BaseJobSource):
         seen_ids: set[str] = set()
         _headless = False if (visible or _visible) else HEADLESS
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=_headless)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            )
-
-            # Restore or create session
+        if context is not None:
+            # Shared-session path: use the provided context; do NOT close it.
+            # Cookie restore is already done by linkedin_session() before yield.
+            # Cookie save is done by linkedin_session() finally block — not here.
             page = await context.new_page()
             page.set_default_timeout(BROWSER_TIMEOUT)
-            await self._ensure_logged_in(page, context, headless=_headless)
-
-            for term in search_terms:
+            try:
+                await self._ensure_logged_in(page, context, headless=_headless)
+                for term in search_terms:
+                    try:
+                        jobs = await self._search_term(page, term, location, min_salary)
+                        for j in jobs:
+                            if j.external_id not in seen_ids:
+                                seen_ids.add(j.external_id)
+                                all_jobs.append(j)
+                    except Exception as e:
+                        log.error(f"LinkedIn search failed for '{term}': {e}")
+                    await asyncio.sleep(random.uniform(8, 15))
+            finally:
+                await page.close()  # page only; context is owned by the caller
+        else:
+            # Standalone path: own the full Playwright lifecycle.
+            # Used by the `scrape` subcommand which calls run_scrape() without a context.
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=_headless)
+                ctx = await browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    # No hardcoded user_agent — use Playwright's current Chromium default.
+                )
+                page = await ctx.new_page()
+                page.set_default_timeout(BROWSER_TIMEOUT)
                 try:
-                    jobs = await self._search_term(page, term, location, min_salary)
-                    for j in jobs:
-                        if j.external_id not in seen_ids:
-                            seen_ids.add(j.external_id)
-                            all_jobs.append(j)
-                except Exception as e:
-                    log.error(f"LinkedIn search failed for '{term}': {e}")
-                await asyncio.sleep(random.uniform(8, 15))
-
-            # Save cookies for next run
-            cookies = await context.cookies()
-            COOKIES_PATH.write_text(json.dumps(cookies))
-            await browser.close()
+                    await self._ensure_logged_in(page, ctx, headless=_headless)
+                    for term in search_terms:
+                        try:
+                            jobs = await self._search_term(page, term, location, min_salary)
+                            for j in jobs:
+                                if j.external_id not in seen_ids:
+                                    seen_ids.add(j.external_id)
+                                    all_jobs.append(j)
+                        except Exception as e:
+                            log.error(f"LinkedIn search failed for '{term}': {e}")
+                        await asyncio.sleep(random.uniform(8, 15))
+                    cookies = await ctx.cookies()
+                    COOKIES_PATH.write_text(json.dumps(cookies))
+                finally:
+                    await browser.close()
 
         log.info(f"LinkedIn: {len(all_jobs)} jobs found")
         return all_jobs
@@ -156,6 +209,16 @@ class LinkedInSource(BaseJobSource):
                 except Exception as e:
                     log.debug(f"LinkedIn card parse error: {e}")
 
+            # Single summary warning per page — replaces per-card WARNING spam.
+            # Only fires when the company selector chain fails for some or all cards.
+            unknown_count = sum(1 for j in jobs if j.company == "Unknown")
+            if unknown_count:
+                log.warning(
+                    f"{unknown_count}/{len(jobs)} jobs on page {page_num + 1} "
+                    f"for '{keywords}' had unknown company "
+                    f"— company selector chain may need updating (see Step 10.3)"
+                )
+
             await asyncio.sleep(RATE_LIMIT_LINKEDIN)
 
         return jobs
@@ -165,7 +228,7 @@ class LinkedInSource(BaseJobSource):
         title_el = await card.query_selector('.job-card-list__title, a[class*="job-card-list__title"]')
         if not title_el:
             return None
-        title = (await title_el.inner_text()).strip()
+        title = (await title_el.inner_text()).strip().split("\n")[0].strip()
 
         # Link and ID
         link_el = await card.query_selector('a[href*="/jobs/view/"]')
@@ -190,13 +253,20 @@ class LinkedInSource(BaseJobSource):
             log.debug(f"Skipping card with no URL and no external_id (title='{title[:50]}')")
             return None
 
-        # Company
-        company_el = await card.query_selector('.job-card-container__primary-description, [class*="company"]')
-        if company_el:
-            company = (await company_el.inner_text()).strip()
-        else:
-            company = "Unknown"
-            log.warning(f"Could not extract company for job '{title[:50]}' — defaulting to 'Unknown'")
+        # Company — try each selector in priority order; "Unknown" only if all fail.
+        company = "Unknown"
+        for _sel in _COMPANY_SELECTORS:
+            _el = await card.query_selector(_sel)
+            if _el:
+                _text = (await _el.inner_text()).strip().split("\n")[0].strip()
+                if _text:
+                    company = _text
+                    break
+        if company == "Unknown":
+            # Demoted to DEBUG — per-card warnings cause 25+ log lines per page per search
+            # term when the selector chain is stale. A single summary WARNING is emitted
+            # at the end of each page loop in _search_term() instead.
+            log.debug(f"Could not extract company for '{title[:50]}' — selector chain may need updating")
 
         # Location
         loc_el = await card.query_selector('.job-card-container__metadata-item, [class*="location"]')

@@ -1,5 +1,6 @@
 """SQLite store for jobs, match scores, and application tracking."""
 
+import logging
 import sqlite3
 from datetime import datetime
 from typing import Optional
@@ -9,6 +10,8 @@ from auto_apply.models import (
     ApplicationStatus, ApplyMethod,
 )
 
+
+log = logging.getLogger(__name__)
 
 _db_initialized: bool = False
 
@@ -79,6 +82,20 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_app_status ON applications(status);
         """)
         conn.commit()
+
+        # Phase 10.8 migration: add diagnostic columns to the applications table.
+        # ALTER TABLE ADD COLUMN raises OperationalError if the column already
+        # exists — catching it makes this block idempotent across re-inits.
+        for _migration in (
+            "ALTER TABLE applications ADD COLUMN screenshot_path TEXT",
+            "ALTER TABLE applications ADD COLUMN failure_url TEXT",
+        ):
+            try:
+                conn.execute(_migration)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists — safe to ignore
+
         _db_initialized = True
     finally:
         conn.close()
@@ -163,15 +180,19 @@ def record_application(app: Application):
     conn = _get_conn()
     try:
         conn.execute(
-            """INSERT INTO applications (job_id, status, method, applied_at, error_message)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO applications
+                   (job_id, status, method, applied_at, error_message,
+                    screenshot_path, failure_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(job_id) DO UPDATE SET
                  status=excluded.status, method=excluded.method,
-                 applied_at=excluded.applied_at, error_message=excluded.error_message
+                 applied_at=excluded.applied_at, error_message=excluded.error_message,
+                 screenshot_path=excluded.screenshot_path,
+                 failure_url=excluded.failure_url
             """,
             (app.job_id, app.status.value, app.method.value,
              app.applied_at.isoformat() if app.applied_at else None,
-             app.error_message),
+             app.error_message, app.screenshot_path, app.failure_url),
         )
         conn.commit()
     finally:
@@ -202,11 +223,29 @@ def get_unapplied_matches(min_score: int = 70) -> list[dict]:
                FROM jobs j
                JOIN match_scores m ON j.id = m.job_id
                LEFT JOIN applications a ON j.id = a.job_id
+                   AND a.status IN ('applied', 'skipped')
                WHERE m.score >= ? AND a.id IS NULL
                ORDER BY m.score DESC""",
             (min_score,),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def reset_failed_applications() -> int:
+    """Delete all failed application records, re-queuing them for retry.
+
+    Returns:
+        Number of records deleted.
+    """
+    conn = _get_conn()
+    try:
+        cursor = conn.execute("DELETE FROM applications WHERE status = 'failed'")
+        count = cursor.rowcount
+        conn.commit()
+        log.info(f"Cleared {count} failed application records — jobs re-queued for retry")
+        return count
     finally:
         conn.close()
 
@@ -224,6 +263,37 @@ def get_all_jobs_with_status() -> list[dict]:
                ORDER BY m.score DESC NULLS LAST, j.scraped_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_distinct_locations(job_ids: list[int] | None = None) -> list[str]:
+    """Return distinct non-empty location values from recently scraped jobs.
+
+    Args:
+        job_ids: If provided, filter to these specific job IDs.
+                 If None, returns all distinct locations scraped in the last 24 hours.
+
+    Returns:
+        List of unique location strings, excluding empty/null values.
+    """
+    conn = _get_conn()
+    try:
+        if job_ids:
+            placeholders = ",".join("?" * len(job_ids))
+            rows = conn.execute(
+                f"SELECT DISTINCT location FROM jobs "
+                f"WHERE location != '' AND location IS NOT NULL "
+                f"AND id IN ({placeholders})",
+                job_ids,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT location FROM jobs "
+                "WHERE location != '' AND location IS NOT NULL "
+                "AND scraped_at > datetime('now', '-1 day')"
+            ).fetchall()
+        return [row["location"] for row in rows]
     finally:
         conn.close()
 

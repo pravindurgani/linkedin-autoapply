@@ -4,19 +4,73 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 
 import anthropic
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, BrowserContext, Page
 
-from auto_apply.config import (
-    HEADLESS, BROWSER_TIMEOUT, CONFIG_DIR, CLAUDE_MODEL_SCORING,
-)
+from auto_apply.config import CONFIG_DIR, HEADLESS, BROWSER_TIMEOUT, CLAUDE_MODEL_SCORING
+from auto_apply.browser import COOKIES_PATH
 from auto_apply.cv_parser import extract_cv_text
 from auto_apply.applier.base import BaseApplier
 
 log = logging.getLogger(__name__)
-COOKIES_PATH = CONFIG_DIR / "linkedin_cookies.json"
+
+# ── Button selector constants ──
+# Single source of truth for all apply-related CTA detection in _apply_on_page().
+# Both wait_for_selector (CSS) and page.evaluate() (JS) are derived from these lists,
+# ensuring wait and click targets are always in sync — a change in one place applies
+# everywhere without a second edit.
+#
+# LinkedIn rebranding context (2025–2026):
+#   - Old label:   "Easy Apply" (aria-label / button text)
+#   - New labels:  "LinkedIn Apply", "Apply Connect", or "Apply to {job title}"
+#   - Stable anchors that survive label renames:
+#       #jobs-apply-button-id             (dedicated HTML ID — most stable)
+#       data-live-test-job-apply-button   (test attribute — survives any label change)
+#       class*="jobs-apply-button"        (BEM class — changes less often than labels)
+#
+# To adapt after future renames: add new aria-label variants to _EASY_APPLY_SELECTORS.
+# Do NOT remove existing entries — they serve as backwards-compat fallbacks for
+# accounts still on the old "Easy Apply" branding.
+
+# In-platform Easy Apply / Apply Connect button.
+# Ordered: most specific/stable → least specific (generic aria-label last).
+#
+# 2026-03-16: LinkedIn switched from <button> to <a> tags with hashed CSS-module
+# class names.  All selectors are now element-agnostic (no "button" prefix) so they
+# match regardless of tag name.  Legacy button-prefixed entries are kept at the end
+# for accounts that still render the old DOM.
+_EASY_APPLY_SELECTORS: list[str] = [
+    # ── element-agnostic (current LinkedIn DOM: <a> tags, hashed classes) ──
+    '[aria-label*="Easy Apply"]',             # primary — matches <a aria-label="Easy Apply to this job">
+    '[aria-label*="LinkedIn Apply"]',         # Apply Connect rebrand variant
+    '[aria-label*="Apply to"]',              # generic last-resort
+    # ── legacy anchors (pre-2026 <button> DOM) — kept as backwards-compat ──
+    "#jobs-apply-button-id",                  # dedicated HTML ID
+    "[data-live-test-job-apply-button]",      # test attribute
+    '[class*="jobs-apply-button"]',           # BEM class
+]
+
+# External-apply button: redirects user off LinkedIn to the company's own ATS.
+# Structural selectors only — broad aria-label matches (e.g., "Apply now") are
+# intentionally excluded because they risk collision with Apply Connect labels.
+_EXTERNAL_APPLY_SELECTORS: list[str] = [
+    'a[href*="externalApply"]',                              # anchor with external href (element-agnostic class)
+    'a[class*="jobs-apply-button"][href*="externalApply"]',  # legacy: BEM class + external href
+    '[aria-label*="Apply on company"]',                      # explicit external-origin label
+]
+
+# LinkedIn Connect button appearing on a job page when Apply is absent.
+# Indicates: job is closed, recruiter disabled Apply, or posting has no Apply
+# integration. Without this check the code waits a full 10s timeout and returns
+# "Easy Apply button not visible" — consuming a failed-application slot and giving
+# zero diagnostic context. These jobs should be classified as skipped.
+_CONNECT_BUTTON_SELECTORS: list[str] = [
+    "[data-live-test-connect-button]",    # dedicated test attribute for the Connect CTA
+    '[aria-label*="Connect with"]',       # person-to-person connection label pattern (element-agnostic)
+]
 
 # ── Runtime config (set via configure()) ──
 _api_key: str = ""
@@ -229,7 +283,7 @@ def _build_quick_answers(config: dict) -> dict:
         r"^full.?name$|^name$": name,
         r"email|e-mail|email.address": email,
         r"phone|telephone|mobile|contact.number": phone,
-        r"summary|about.*you|cover.*letter|message|introduction": "",
+        r"summary|about.*you|cover.*letter|introduction": "",
     }
 
     # Salary and location come from runtime config — omit if not set so Claude
@@ -292,80 +346,246 @@ def answer_question(question: str, options: list[str] | None = None,
 class LinkedInApplier(BaseApplier):
     name = "linkedin"
 
-    # ARCHITECTURE NOTE (Phase 10):
-    # Each apply() call launches a fresh Playwright browser instance.
-    # This is safe (isolated failures) but observable by LinkedIn's bot detection
-    # when multiple applications are submitted in sequence from the same IP.
-    # Phase 10 improvement: accept an optional pre-authenticated Page/Context
-    # and reuse the scraper's existing browser session. This would also allow
-    # description scraping (Phase 10 Gap 3 fix) to share the session.
-    # Until Phase 10: the per-apply delay in pipeline.py (Step 9.1) is the
-    # primary mitigation for session-frequency detection.
-    async def apply(self, job: dict) -> tuple[bool, str]:
-        if not _linkedin_email or not _linkedin_password:
-            return False, "LinkedIn credentials not configured — run linkedin-autoapply setup"
+    async def _capture_diagnostics(
+        self, page: Page, job: dict, stage: str
+    ) -> tuple[str | None, str | None]:
+        """Capture screenshot, URL, and page title at the point of apply failure.
 
-        if not job.get("easy_apply"):
-            return False, "Not an Easy Apply job"
+        Saves a full-page screenshot to CONFIG_DIR/diagnostics/ and logs a
+        structured WARNING with all context needed to diagnose the failure.
+        Never raises — wraps all I/O in try/except so a capture failure cannot
+        mask the original error or crash the pipeline.
 
-        url = job.get("url", "")
-        if not url:
-            return False, "No job URL"
+        Filename format: {timestamp}_{job_id}_{job_slug}.png
+        The job_id component ensures uniqueness across multiple failures in a
+        single run even when they occur within the same second.
 
-        job_title = job.get("title", "Unknown")
-        _headless = False if _visible else HEADLESS
+        Args:
+            page: Playwright Page at the moment of failure (must still be open).
+            job: Job dict — used for filename slug and log context.
+            stage: Short identifier for the failure point (e.g. "button_not_found").
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=_headless)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        Returns:
+            (screenshot_path_str, failure_url) — both None if capture itself fails.
+        """
+        try:
+            diag_dir = CONFIG_DIR / "diagnostics"
+            diag_dir.mkdir(exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            job_id = job.get("id", "unknown")
+            raw_title = job.get("title", "unknown")[:30]
+            job_slug = re.sub(r"\W+", "_", raw_title).strip("_") or "job"
+            fname = f"{timestamp}_{job_id}_{job_slug}.png"
+            screenshot_path = diag_dir / fname
+
+            # Capture URL before screenshot in case screenshot navigation changes it.
+            failure_url = page.url  # synchronous property — always safe to read
+            page_title = await page.title()
+
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+
+            log.warning(
+                f"  DIAGNOSTIC [{stage}] | job_id={job_id} | "
+                f"title={job.get('title', '')!r} | "
+                f"failure_url={failure_url!r} | "
+                f"page_title={page_title!r} | "
+                f"screenshot={screenshot_path}"
             )
+            return str(screenshot_path), failure_url
+        except Exception as diag_err:
+            log.debug(f"  Diagnostic capture failed ({stage}): {diag_err}")
+            try:
+                return None, page.url
+            except Exception:
+                return None, None
+
+    async def apply(
+        self, job: dict, context: BrowserContext | None = None
+    ) -> tuple[bool, str, str | None, str | None]:
+        """Attempt to apply to a job via LinkedIn Easy Apply.
+
+        Args:
+            job: Job dict with 'url', 'title', 'easy_apply' keys.
+            context: Shared BrowserContext from linkedin_session(). A new Page
+                is created and closed within this context for each application —
+                context is not touched on failure, so subsequent jobs are not
+                affected. If None, a standalone browser lifecycle is used.
+
+        Returns:
+            (success, message, screenshot_path, failure_url).
+            screenshot_path and failure_url are None on success or permanent skips.
+        """
+        if not _linkedin_email or not _linkedin_password:
+            return False, "LinkedIn credentials not configured — run linkedin-autoapply setup", None, None
+        if not job.get("easy_apply"):
+            return False, "Not an Easy Apply job", None, None
+        if not job.get("url", ""):
+            return False, "No job URL", None, None
+
+        if context is not None:
+            # Shared-session path: new Page within the authenticated context.
+            # Cookie restore and save are both handled by linkedin_session() —
+            # no cookie I/O here. A page-level exception closes the Page only;
+            # the shared context remains open for subsequent applications.
             page = await context.new_page()
             page.set_default_timeout(BROWSER_TIMEOUT)
-
             try:
-                # Restore cookies
-                if COOKIES_PATH.exists():
-                    cookies = json.loads(COOKIES_PATH.read_text())
-                    await context.add_cookies(cookies)
-
-                await page.goto(url, wait_until="domcontentloaded")
-                await asyncio.sleep(3)
-
-                # Check if logged in
-                if "login" in page.url or "authwall" in page.url:
-                    await self._login(page)
-                    await page.goto(url, wait_until="domcontentloaded")
-                    await asyncio.sleep(3)
-
-                # Click Easy Apply button via JS
-                clicked = await page.evaluate('''() => {
-                    const btn = document.querySelector('button[class*="jobs-apply-button"]');
-                    if (btn) { btn.click(); return true; }
-                    return false;
-                }''')
-                if not clicked:
-                    return False, "Easy Apply button not found"
-
-                await asyncio.sleep(3)
-
-                # Fill the modal form step by step
-                success = await self._fill_modal(page, job_title)
-
-                # Save cookies
-                cookies = await context.cookies()
-                COOKIES_PATH.write_text(json.dumps(cookies))
-
-                if success:
-                    return True, "Applied via LinkedIn Easy Apply"
-                return False, "Form filling incomplete"
-
+                return await self._apply_on_page(page, job)
             except Exception as e:
                 log.error(f"LinkedIn apply failed: {e}")
-                return False, f"Error: {str(e)[:200]}"
+                screenshot_path, failure_url = await self._capture_diagnostics(
+                    page, job, "unhandled_exception"
+                )
+                return False, f"Error: {str(e)[:200]}", screenshot_path, failure_url
             finally:
-                await browser.close()
+                await page.close()
+        else:
+            # Standalone path: own the full browser lifecycle.
+            # Used when apply() is called outside of linkedin_session() context
+            # (e.g. future standalone apply subcommand).
+            _headless = False if _visible else HEADLESS
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=_headless)
+                ctx = await browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = await ctx.new_page()
+                page.set_default_timeout(BROWSER_TIMEOUT)
+                try:
+                    if COOKIES_PATH.exists():
+                        cookies = json.loads(COOKIES_PATH.read_text())
+                        await ctx.add_cookies(cookies)
+                    result = await self._apply_on_page(page, job)
+                    cookies = await ctx.cookies()
+                    COOKIES_PATH.write_text(json.dumps(cookies))
+                    return result
+                except Exception as e:
+                    log.error(f"LinkedIn apply failed: {e}")
+                    screenshot_path, failure_url = await self._capture_diagnostics(
+                        page, job, "unhandled_exception"
+                    )
+                    return False, f"Error: {str(e)[:200]}", screenshot_path, failure_url
+                finally:
+                    await browser.close()
+
+    async def _apply_on_page(
+        self, page: Page, job: dict
+    ) -> tuple[bool, str, str | None, str | None]:
+        """Core apply logic. Assumes page is within an authenticated context.
+
+        Three-stage detection sequence, in priority order:
+          1. External-apply early exit — redirects to company ATS → skipped
+          2. Connect button detection — job closed / recruiter-only → skipped
+          3. Easy Apply button wait and click — in-platform form → proceed
+
+        Stages 1 and 2 use query_selector (non-blocking) so they resolve in <1s
+        when positive. Stage 3 uses wait_for_selector with a 10s timeout to allow
+        for React hydration.
+
+        All selector lists are derived from the module-level constants
+        _EASY_APPLY_SELECTORS, _EXTERNAL_APPLY_SELECTORS, and
+        _CONNECT_BUTTON_SELECTORS — edit those constants to update detection
+        without touching this method.
+
+        Args:
+            page: Playwright Page — may be shared-context or standalone.
+            job: Job dict with at least 'url' and 'title' keys.
+
+        Returns:
+            (success, message, screenshot_path, failure_url).
+            screenshot_path and failure_url are None for skips and successes.
+        """
+        url = job.get("url", "")
+        job_title = job.get("title", "Unknown")
+
+        await page.goto(url, wait_until="domcontentloaded")
+
+        # Auth safety net — should not trigger with shared context (scraper
+        # already authenticated it) but kept for standalone path and edge cases.
+        if "login" in page.url or "authwall" in page.url:
+            await self._login(page)
+            await page.goto(url, wait_until="domcontentloaded")
+
+        # Stage 1: External-apply early exit.
+        # Must run before the Easy Apply wait — avoids a 10s timeout on ATS-redirect
+        # pages. Structural selectors only: the href*="externalApply" anchor is the
+        # most reliable signal. Broad aria-label matches are avoided because labels
+        # like "Apply now" could collide with Apply Connect post-rebrand.
+        external_btn = await page.query_selector(", ".join(_EXTERNAL_APPLY_SELECTORS))
+        if external_btn:
+            return False, "External apply only (not Easy Apply)", None, None
+
+        # Stage 2: Connect button detection.
+        # The Connect CTA appears when: the job posting is closed, the recruiter
+        # disabled the Apply integration, or it is a recruiter-profile post with no
+        # Apply button. The page loads normally so the auth check above passes; the
+        # failure mode is simply that no Apply button exists. Without this check the
+        # code waits the full 10s timeout and emits "Easy Apply button not visible
+        # after wait" — an unhelpful message that masks the real cause.
+        connect_btn = await page.query_selector(", ".join(_CONNECT_BUTTON_SELECTORS))
+        if connect_btn:
+            log.info(f"Connect button found on {url!r} — job may be closed or recruiter-only")
+            return False, "Connect button found — not an Apply job (job may be closed or recruiter-only)", None, None
+
+        # Stage 3: Wait for Easy Apply / Apply Connect button (React hydration).
+        # wait_for_selector fires as soon as ANY selector in the comma-separated CSS
+        # string matches.
+        _wait_sel = ", ".join(_EASY_APPLY_SELECTORS)
+        _EASY_APPLY_TIMEOUT = 10_000  # 10s — enough for React hydration; fast exit for recruiter pages
+        try:
+            await page.wait_for_selector(_wait_sel, timeout=_EASY_APPLY_TIMEOUT, state="visible")
+        except Exception:
+            screenshot_path, failure_url = await self._capture_diagnostics(
+                page, job, "button_not_found"
+            )
+            return False, "Easy Apply button not visible after wait", screenshot_path, failure_url
+
+        # Open the apply form.  LinkedIn switched from <button> to <a> tags in 2026.
+        # The <a> element has href="…/apply/?openSDUIApplyFlow=true" which opens the
+        # artdeco-modal apply flow.  JS .click() on the <a> doesn't reliably trigger
+        # React's client-side navigation, so we extract the href and navigate directly.
+        # Falls back to Playwright .click() for legacy <button> DOM or missing href.
+        _selectors_js = json.dumps(_EASY_APPLY_SELECTORS)
+        apply_href = await page.evaluate(f"""() => {{
+            const selectors = {_selectors_js};
+            for (const sel of selectors) {{
+                const el = document.querySelector(sel);
+                if (el) {{
+                    const href = el.getAttribute('href') || el.href;
+                    if (href && href.includes('/apply')) return href;
+                }}
+            }}
+            return null;
+        }}""")
+
+        if apply_href:
+            # Navigate to the SDUI apply URL (opens the artdeco-modal form)
+            if apply_href.startswith('/'):
+                apply_href = "https://www.linkedin.com" + apply_href
+            await page.goto(apply_href, wait_until="domcontentloaded")
+        else:
+            # Fallback: Playwright click for legacy <button> DOM
+            for sel in _EASY_APPLY_SELECTORS:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.click()
+                    break
+            else:
+                screenshot_path, failure_url = await self._capture_diagnostics(
+                    page, job, "click_failed"
+                )
+                return False, "Easy Apply button found by wait but click failed", screenshot_path, failure_url
+
+        await asyncio.sleep(3)
+
+        success = await self._fill_modal(page, job_title)
+        if success:
+            return True, "Applied via LinkedIn Easy Apply", None, None
+        screenshot_path, failure_url = await self._capture_diagnostics(
+            page, job, "form_incomplete"
+        )
+        return False, "Form filling incomplete", screenshot_path, failure_url
 
     async def _login(self, page: Page):
         log.info("LinkedIn: logging in for apply...")

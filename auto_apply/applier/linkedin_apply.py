@@ -80,6 +80,39 @@ _linkedin_password: str = ""
 _cv_path: str = ""
 _QUICK_ANSWERS: dict = {}
 
+# ── Visa sponsorship runtime state ──
+# Set once per run via prompt_visa_status(). Persists across all apply
+# attempts in the same run. Reset on configure().
+#   None  = not yet asked / skipped (defer to Claude)
+#   False = does not require sponsorship (auto-answer)
+#   True  = requires sponsorship (defer to Claude with context)
+_visa_needs_sponsorship: bool | None = None
+_visa_prompted: bool = False
+_work_authorisation: str = ""  # Populated from config.json via configure()
+
+# Visa question detection — two categories with opposite answer polarities.
+# "Right to work" questions ask "do you have permission?" → Yes when no sponsorship.
+# "Sponsorship" questions ask "do you need help?" → No when no sponsorship.
+_VISA_RIGHT_TO_WORK_RE = re.compile(
+    r"right.to.work|"
+    r"(?:authoriz|authoris)\w*.+work|work.+(?:authoriz|authoris)|"
+    r"eligible.+work|"
+    r"work.+permit|"
+    r"legally.+work|"
+    r"legal.+right.+work|"
+    r"permission.+work",
+    re.IGNORECASE,
+)
+_VISA_SPONSORSHIP_RE = re.compile(
+    r"require.+sponsor|need.+sponsor|"
+    r"sponsor.+require|sponsor.+need|"
+    r"visa.+sponsor|sponsor.+visa|"
+    r"immigration.+sponsor|"
+    r"will.+you.+require.+visa|future.+sponsor|"
+    r"now.+or.+(?:in.+the.+)?future.+require",
+    re.IGNORECASE,
+)
+
 # ── Claude client singleton ──
 _claude_client: anthropic.Anthropic | None = None
 
@@ -100,6 +133,85 @@ def _get_cv_text() -> str:
     if _cv_text is None:
         _cv_text = extract_cv_text(cv_path=_cv_path if _cv_path else None)
     return _cv_text
+
+
+def prompt_visa_status() -> None:
+    """Prompt the user for visa sponsorship status. Called once per run.
+
+    Accepts y/n/s. The answer persists across all apply attempts in the
+    same run. Subsequent calls are no-ops until configure() resets state.
+    """
+    global _visa_needs_sponsorship, _visa_prompted
+    if _visa_prompted:
+        return
+    _visa_prompted = True
+    if _visa_needs_sponsorship is not None:
+        log.info("Visa status: loaded from config")
+        return
+
+    print("\n" + "-" * 50)
+    print("  VISA / WORK AUTHORISATION")
+    print("-" * 50)
+    print("  Do you require visa sponsorship to work in")
+    print("  the country where these jobs are located?")
+    print()
+    print("  [y] Yes - I require sponsorship")
+    print("  [n] No  - I have the right to work")
+    print("  [s] Skip - not applicable / prefer not to say")
+    print("-" * 50)
+
+    while True:
+        try:
+            choice = input("  Your answer [y/n/s]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            log.info("Visa prompt skipped (non-interactive) — deferring to Claude")
+            return
+        if choice in ("y", "yes"):
+            _visa_needs_sponsorship = True
+            log.info("Visa status: requires sponsorship — visa questions deferred to Claude")
+            break
+        elif choice in ("n", "no"):
+            _visa_needs_sponsorship = False
+            log.info("Visa status: does not require sponsorship — visa questions auto-answered")
+            break
+        elif choice in ("s", "skip", ""):
+            log.info("Visa status: skipped — visa questions deferred to Claude")
+            break
+        else:
+            print("  Please enter y, n, or s")
+
+
+def _build_screening_system_prompt() -> str:
+    """Build the system prompt for Claude screening answers, including visa context."""
+    base = (
+        "You are filling out a job application form. Answer screening questions "
+        "honestly based on the CV. Always present the candidate positively. "
+        "For Yes/No questions, answer Yes when the candidate has relevant experience. "
+        "For years of experience, give realistic numbers based on the CV."
+    )
+    if _visa_needs_sponsorship is True:
+        base += (
+            " IMPORTANT: The candidate requires visa sponsorship to work in the "
+            "country where this job is located. Answer all visa, work authorisation, "
+            "and sponsorship questions honestly reflecting this requirement."
+        )
+    elif _visa_needs_sponsorship is False:
+        auth_detail = ""
+        if _work_authorisation:
+            _AUTH_READABLE = {
+                "citizen": "citizen / permanent resident",
+                "pre_settled": "pre-settled or settled status",
+                "valid_visa": "valid work visa",
+                "skilled_worker_uk": "Skilled Worker visa (UK)",
+                "other": "other authorisation",
+            }
+            label = _AUTH_READABLE.get(_work_authorisation, _work_authorisation.replace("_", " "))
+            auth_detail = f" ({label})"
+        base += (
+            f" The candidate has full work authorisation{auth_detail} and does not require "
+            "visa sponsorship in the country where this job is located."
+        )
+    return base
 
 
 def _ask_claude(question: str, options: list[str] | None = None,
@@ -133,7 +245,7 @@ Question: {question}
             model=CLAUDE_MODEL_SCORING,
             max_tokens=256,
             temperature=0,
-            system="You are filling out a job application form. Answer screening questions honestly based on the CV. Always present the candidate positively. For Yes/No questions, answer Yes when the candidate has relevant experience. For years of experience, give realistic numbers based on the CV.",
+            system=_build_screening_system_prompt(),
             messages=[{"role": "user", "content": prompt}],
         )
         answer = response.content[0].text.strip()
@@ -214,6 +326,69 @@ def _try_quick_answer(question: str, options: list[str] | None = None) -> str | 
     return None  # No rule matched
 
 
+def _check_visa_question(question: str, options: list[str] | None = None) -> str | None:
+    """Handle visa/sponsorship questions based on runtime visa status.
+
+    Two detection categories with opposite answer polarities:
+      - Right-to-work questions ("authorised to work?") -> Yes when no sponsorship.
+      - Sponsorship questions ("require sponsorship?") -> No when no sponsorship.
+
+    When the user requires sponsorship, all visa questions are deferred to
+    _ask_claude() which receives visa context in its system prompt.
+
+    Args:
+        question: The screening question text.
+        options: Available answer options (radio/select), if any.
+
+    Returns:
+        Answer string if auto-answerable, None to fall through to Claude.
+    """
+    if _visa_needs_sponsorship is None:
+        return None  # Not prompted or skipped — fall through to Claude
+
+    q = question.strip()
+    is_sponsorship_q = _VISA_SPONSORSHIP_RE.search(q)
+    is_right_to_work_q = _VISA_RIGHT_TO_WORK_RE.search(q)
+
+    if not is_sponsorship_q and not is_right_to_work_q:
+        return None  # Not a visa question
+
+    if _visa_needs_sponsorship:
+        # User requires sponsorship — defer to Claude for nuanced answers
+        log.info(f"  Visa question (sponsorship required) — deferring to Claude: '{question[:60]}'")
+        return None
+
+    # User does NOT require sponsorship — auto-answer
+    raw_answer = "No" if is_sponsorship_q else "Yes"
+
+    # Match to provided options (radio/dropdown)
+    if options:
+        target = raw_answer.lower()
+        matched = None
+        for opt in options:
+            opt_lower = opt.lower().strip()
+            if opt_lower == target:
+                matched = opt
+                break
+            if target == "yes" and opt_lower in ("yes", "true", "i agree", "agree"):
+                matched = opt
+                break
+            if target == "no" and opt_lower in ("no", "false", "i disagree", "disagree"):
+                matched = opt
+                break
+        if matched is None:
+            log.debug(
+                f"  Visa auto-answer '{raw_answer}' doesn't match options "
+                f"{options} — deferring to Claude"
+            )
+            return None
+        log.info(f"  Visa auto-answer for '{question[:60]}': {matched}")
+        return matched
+
+    log.info(f"  Visa auto-answer for '{question[:60]}': {raw_answer}")
+    return raw_answer
+
+
 def _build_quick_answers(config: dict) -> dict:
     """Build complete quick answers dict with personal info from config.
 
@@ -265,8 +440,8 @@ def _build_quick_answers(config: dict) -> dict:
 
         # Location-adjacent yes/no (not location field itself)
         r"willing.*relocate": "Yes",
-        r"right.to.work|authorized.*work|eligible.*work|visa|sponsorship": "Yes",
-        r"work.*permit|legally.*work": "Yes",
+        # NOTE: Visa/sponsorship/right-to-work patterns removed from quick answers.
+        # Now handled by _check_visa_question() with runtime visa status prompt.
 
         # Common yes/no
         r"background.?check|criminal|dbs": "Yes",
@@ -307,6 +482,7 @@ def configure(api_key: str, config: dict, visible: bool = False, password: str |
     """
     global _api_key, _visible, _linkedin_email, _linkedin_password, _cv_path
     global _QUICK_ANSWERS, _claude_client, _cv_text
+    global _visa_needs_sponsorship, _visa_prompted, _work_authorisation
     _api_key = api_key
     _visible = visible
     _linkedin_email = config.get("linkedin_email", "")
@@ -314,6 +490,15 @@ def configure(api_key: str, config: dict, visible: bool = False, password: str |
     _QUICK_ANSWERS = _build_quick_answers(config)
     _claude_client = None  # Reset when API key changes
     _cv_text = None        # Reset cache when config changes
+    # Load visa status from config if present; fall back to runtime prompt.
+    # Backwards compat: configs without requires_sponsorship keep the old behaviour.
+    _requires_sponsorship_cfg = config.get("requires_sponsorship")
+    if _requires_sponsorship_cfg is not None:
+        _visa_needs_sponsorship = bool(_requires_sponsorship_cfg)
+    else:
+        _visa_needs_sponsorship = None  # Reset — prompt again on next run
+    _work_authorisation = config.get("work_authorisation", "")
+    _visa_prompted = False
     if password is not None:
         _linkedin_password = password
     else:
@@ -331,6 +516,11 @@ def answer_question(question: str, options: list[str] | None = None,
     q_lower = question.lower()
     if any(skip in q_lower for skip in ["নির্বাচন", "আপলোড", "চিহ্নিত"]):
         return ""
+
+    # Check visa question (uses runtime visa status, not static rules)
+    visa_answer = _check_visa_question(question, options)
+    if visa_answer is not None:
+        return visa_answer
 
     # Try quick rule-based answer
     quick = _try_quick_answer(question, options)

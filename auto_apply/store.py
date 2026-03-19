@@ -298,6 +298,28 @@ def get_distinct_locations(job_ids: list[int] | None = None) -> list[str]:
         conn.close()
 
 
+def get_daily_apply_count() -> int:
+    """Count applications submitted today with status='applied'.
+
+    Uses the local calendar date so the cap resets at midnight local time.
+    The applied_at column stores ISO-format datetimes ("YYYY-MM-DDTHH:MM:SS"),
+    so a LIKE "YYYY-MM-DD%" prefix match correctly isolates the current day.
+
+    Returns:
+        Number of successful applications recorded today.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM applications WHERE status = 'applied' AND applied_at LIKE ?",
+            (f"{today}%",),
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
 def get_stats() -> dict:
     """Get summary statistics."""
     conn = _get_conn()

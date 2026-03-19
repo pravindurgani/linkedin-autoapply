@@ -9,7 +9,10 @@ import pandas as pd
 
 from auto_apply.config import (
     TITLE_MUST_CONTAIN, TITLE_EXCLUDE, REPORT_PATH, SCORE_THRESHOLD,
+    MAX_DAILY_APPLICATIONS, MAX_SESSION_MINUTES,
+    APPLY_BUSINESS_HOURS_ONLY, APPLY_BUSINESS_HOURS_START, APPLY_BUSINESS_HOURS_END,
 )
+
 from auto_apply.models import (
     Job, ApplicationStatus, ApplyMethod, Application,
 )
@@ -21,6 +24,11 @@ from auto_apply.cv_parser import extract_cv_text
 from playwright.async_api import BrowserContext
 
 log = logging.getLogger(__name__)
+
+# Phase 11.7 — LinkedIn's suspected daily Tier 1 restriction threshold.
+# Not configurable — this is LinkedIn's inferred policy, not a user preference.
+# Tier 1: features disabled 1-24h. Tier 2: account locked 3-14 days.
+_LINKEDIN_TIER1_DAILY_THRESHOLD: int = 20
 
 
 def _title_passes_filter(title: str, must_contain: list[str], exclude: list[str]) -> bool:
@@ -117,12 +125,18 @@ async def run_scrape(
     return stored_count
 
 
-async def run_match(api_key: str, cv_text: str) -> int:
+async def run_match(
+    api_key: str,
+    cv_text: str,
+    requires_sponsorship: bool | None = None,
+) -> int:
     """Score unscored jobs against the CV using Claude. Returns count scored.
 
     Args:
         api_key: Anthropic API key.
         cv_text: Extracted CV text.
+        requires_sponsorship: Whether the candidate requires visa sponsorship.
+            Passed to scorer so Claude can penalise non-sponsoring roles.
     """
     unscored = store.get_unscored_jobs()
     if not unscored:
@@ -130,7 +144,7 @@ async def run_match(api_key: str, cv_text: str) -> int:
         return 0
 
     log.info(f"=== MATCHING: {len(unscored)} jobs to score ===")
-    results = score_jobs_batch(unscored, api_key, cv_text)
+    results = score_jobs_batch(unscored, api_key, cv_text, requires_sponsorship=requires_sponsorship)
 
     for result in results:
         store.record_match(result)
@@ -143,18 +157,70 @@ async def run_match(api_key: str, cv_text: str) -> int:
 async def run_apply(
     max_applies: int = 15,
     context: BrowserContext | None = None,
+    max_daily_applications: int = MAX_DAILY_APPLICATIONS,
+    business_hours_only: bool = APPLY_BUSINESS_HOURS_ONLY,
 ) -> int:
     """Apply to unapplied jobs above threshold. Returns count applied.
 
     Args:
-        max_applies: Maximum number of apply attempts this run.
+        max_applies: Maximum apply attempts this run (per-run cap).
         context: Shared BrowserContext from linkedin_session(). Each apply()
             call creates its own Page within this context and closes it on
             return — a page-level failure does not affect subsequent jobs.
             If None, apply() uses a standalone browser per application.
+        max_daily_applications: Hard daily cap — refuse to apply once today's
+            cumulative count reaches this limit. Resets at local midnight.
+        business_hours_only: If True, skip the apply phase when the current
+            local time is outside APPLY_BUSINESS_HOURS_START–END.
     """
     if max_applies <= 0:
         raise ValueError(f"max_applies must be a positive integer, got {max_applies}")
+
+    # Phase 11.7 — Business hours gate.
+    # Checked first so we abort before any browser or DB activity.
+    if business_hours_only:
+        current_hour = datetime.now().hour
+        if not (APPLY_BUSINESS_HOURS_START <= current_hour < APPLY_BUSINESS_HOURS_END):
+            log.warning(
+                f"Apply phase skipped — current hour {current_hour:02d}:xx is outside "
+                f"business hours ({APPLY_BUSINESS_HOURS_START:02d}:00–"
+                f"{APPLY_BUSINESS_HOURS_END:02d}:00, business_hours_only=true). "
+                f"Override in config.json: set business_hours_only to false."
+            )
+            return 0
+
+    # Phase 11.7 — Daily application cap.
+    # Query today's successful application count before touching candidates.
+    today_count = store.get_daily_apply_count()
+    remaining_today = max_daily_applications - today_count
+    if remaining_today <= 0:
+        log.warning(
+            f"Daily application cap reached ({today_count}/{max_daily_applications} today). "
+            f"Apply phase aborted. Cap resets at local midnight. "
+            f"Adjust max_daily_applications in config.json to change the limit."
+        )
+        return 0
+    if today_count >= int(max_daily_applications * 0.8):
+        log.warning(
+            f"Approaching daily cap: {today_count}/{max_daily_applications} applications "
+            f"submitted today ({int(today_count / max_daily_applications * 100)}% of limit)."
+        )
+
+    # Phase 11.7 — LinkedIn Tier 1 threshold advisory.
+    # Fires regardless of the user's cap setting to surface the risk.
+    if today_count >= _LINKEDIN_TIER1_DAILY_THRESHOLD:
+        log.warning(
+            f"Applications today ({today_count}) are at or above LinkedIn's suspected "
+            f"Tier 1 restriction threshold (~{_LINKEDIN_TIER1_DAILY_THRESHOLD}/day). "
+            f"Account restrictions (feature lock 1-24h) may already be active."
+        )
+    elif today_count + max_applies > _LINKEDIN_TIER1_DAILY_THRESHOLD:
+        projected = today_count + max_applies
+        log.warning(
+            f"This run may push daily total to ~{projected} — above LinkedIn's suspected "
+            f"Tier 1 threshold (~{_LINKEDIN_TIER1_DAILY_THRESHOLD}/day). "
+            f"Reduce max_daily_applications in config.json to stay under the threshold."
+        )
 
     # Session health check — verify the shared context is authenticated before
     # attempting any applications. Aborts early with a clear error rather than
@@ -174,9 +240,25 @@ async def run_apply(
         log.info("No unapplied matches to apply for.")
         return 0
 
-    if len(candidates) > max_applies:
-        log.info(f"Capping at {max_applies} attempts (found {len(candidates)} candidates). Run again to continue.")
-        candidates = candidates[:max_applies]
+    # Prompt for visa status once per run (no-op if already prompted).
+    # Placed after candidate check so prompt only appears when there are
+    # jobs to apply to. prompt_visa_status() is idempotent within a run.
+    from auto_apply.applier.linkedin_apply import prompt_visa_status
+    prompt_visa_status()
+
+    # Cap to the lower of: per-run limit and remaining daily capacity.
+    effective_cap = min(max_applies, remaining_today)
+    if len(candidates) > effective_cap:
+        reason = (
+            f"daily cap ({remaining_today} remaining)"
+            if effective_cap == remaining_today and remaining_today < max_applies
+            else f"--max-applies ({max_applies})"
+        )
+        log.info(
+            f"Capping at {effective_cap} attempts due to {reason} "
+            f"(found {len(candidates)} candidates). Run again to continue."
+        )
+        candidates = candidates[:effective_cap]
 
     log.info(f"=== APPLYING: {len(candidates)} jobs to apply for ===")
     applied_count = 0
@@ -324,11 +406,18 @@ async def run_full_pipeline(
     configure_applier(api_key=api_key, config=config, visible=visible, password=password)
     configure_source(email=config["linkedin_email"], password=password, visible=visible)
 
+    # Phase 11.7 — read rate-limit settings from config (fall back to system defaults).
+    max_daily_applications = int(config.get("max_daily_applications", MAX_DAILY_APPLICATIONS))
+    max_session_minutes = int(config.get("max_session_minutes", MAX_SESSION_MINUTES))
+    business_hours_only = bool(config.get("business_hours_only", APPLY_BUSINESS_HOURS_ONLY))
+
     # 4–6. Run scrape + score + apply inside a single shared browser session.
     # The scraper authenticates the context once; the applier reuses it for every
     # application in the batch — preserving localStorage/sessionStorage/IndexedDB
     # tokens that LinkedIn requires for full authentication.
     from auto_apply.browser import linkedin_session
+
+    session_start = datetime.now()  # Phase 11.7: track session duration
 
     async with linkedin_session(visible=visible) as context:
         # 4. Scrape
@@ -336,13 +425,34 @@ async def run_full_pipeline(
 
         # 5. Score (no browser needed — pure API calls)
         cv_text = extract_cv_text()
-        await run_match(api_key, cv_text)
+        requires_sponsorship = config.get("requires_sponsorship")
+        await run_match(api_key, cv_text, requires_sponsorship=requires_sponsorship)
 
         # 6. Apply (session health check runs inside run_apply before the loop)
         if dry_run:
             log.info("--dry-run: skipping application submission")
         else:
-            await run_apply(max_applies=max_applies, context=context)
+            # Phase 11.7 — session duration gate before apply phase.
+            elapsed_min = (datetime.now() - session_start).total_seconds() / 60
+            if elapsed_min >= max_session_minutes:
+                log.warning(
+                    f"Session duration limit reached ({elapsed_min:.0f}/{max_session_minutes} min) "
+                    f"— skipping apply phase to limit account exposure. "
+                    f"Adjust max_session_minutes in config.json to change the limit."
+                )
+            else:
+                if elapsed_min >= max_session_minutes * 0.8:
+                    log.warning(
+                        f"Session approaching duration limit "
+                        f"({elapsed_min:.0f}/{max_session_minutes} min, "
+                        f"{int(elapsed_min / max_session_minutes * 100)}% elapsed)."
+                    )
+                await run_apply(
+                    max_applies=max_applies,
+                    context=context,
+                    max_daily_applications=max_daily_applications,
+                    business_hours_only=business_hours_only,
+                )
 
     # 7. Report (browser already closed by linkedin_session finally block)
     run_export()

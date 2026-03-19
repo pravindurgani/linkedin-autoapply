@@ -28,6 +28,8 @@ Consider:
 3. Domain relevance (data analytics, marketing tech, iGaming industry)
 4. Tool/platform match (Power BI, GA4, Streamlit, D365, etc.)
 5. Salary expectations vs candidate's level
+6. Visa/sponsorship — if the candidate requires sponsorship, penalise jobs that
+   explicitly state "no sponsorship" or are from small companies unlikely to sponsor.
 
 You MUST respond with valid JSON only. No other text.
 
@@ -39,6 +41,7 @@ You MUST respond with valid JSON only. No other text.
 }"""
 
 _claude_client: anthropic.Anthropic | None = None
+_requires_sponsorship: bool | None = None
 
 
 def _get_client(api_key: str) -> anthropic.Anthropic:
@@ -56,6 +59,7 @@ def score_job(
     salary_text: str,
     cv_text: str,
     api_key: str,
+    requires_sponsorship: bool | None = None,
 ) -> MatchResult | None:
     """Score a job against the CV using Claude Haiku.
 
@@ -63,23 +67,32 @@ def score_job(
         job_id: Database ID of the job.
         title: Job title.
         company: Company name.
-        description: Full job description text. Currently always "" (descriptions not scraped
-            at card level — see sources/linkedin.py note). Scoring is title+company only.
-        salary_text: Human-readable salary string. Currently always None (not parsed from
-            cards).
+        description: Full job description text extracted from the job detail page
+            (Phase 11.1). Empty string if description scraping failed or was unavailable.
+        salary_text: Human-readable salary string from LinkedIn card element. None if
+            salary was not displayed on the card.
         cv_text: Extracted CV text (first 3000 chars used).
         api_key: Anthropic API key.
+        requires_sponsorship: Whether the candidate requires visa sponsorship.
+            None means unknown — no visa context is added to the prompt.
 
     Returns:
         MatchResult with score, reasoning, matched_skills, missing_skills.
     """
+    if requires_sponsorship is True:
+        visa_line = "\n**Visa:** Candidate requires sponsorship"
+    elif requires_sponsorship is False:
+        visa_line = "\n**Visa:** Candidate has full work authorisation"
+    else:
+        visa_line = ""
+
     user_msg = f"""## Candidate CV
 {cv_text[:3000]}
 
 ## Job Posting
 **Title:** {title}
 **Company:** {company}
-**Salary:** {salary_text or 'Not specified'}
+**Salary:** {salary_text or 'Not specified'}{visa_line}
 
 **Description:**
 {description[:3000]}
@@ -130,13 +143,20 @@ Score this match as JSON."""
     return None
 
 
-def score_jobs_batch(jobs: list[dict], api_key: str, cv_text: str) -> list[MatchResult]:
+def score_jobs_batch(
+    jobs: list[dict],
+    api_key: str,
+    cv_text: str,
+    requires_sponsorship: bool | None = None,
+) -> list[MatchResult]:
     """Score multiple jobs sequentially.
 
     Args:
         jobs: List of job dicts from the database.
         api_key: Anthropic API key.
         cv_text: Extracted CV text to score against.
+        requires_sponsorship: Whether the candidate requires visa sponsorship.
+            Passed through to each score_job() call for scoring context.
 
     Returns:
         List of MatchResult objects.
@@ -154,6 +174,7 @@ def score_jobs_batch(jobs: list[dict], api_key: str, cv_text: str) -> list[Match
             salary_text=job.get("salary_text", ""),
             cv_text=cv_text,
             api_key=api_key,
+            requires_sponsorship=requires_sponsorship,
         )
         if result is None:
             log.warning(f"  Skipping record for job {job['id']} ({job['title'][:50]}) — scoring failed, will retry next run")

@@ -16,6 +16,17 @@ from auto_apply.config import CONFIG_DIR
 
 log = logging.getLogger(__name__)
 
+# ── Phase 11.6 — playwright-stealth integration ──
+# Imported at module level so the presence/absence of the package is detected once.
+# The pipeline degrades gracefully if the package is missing: stealth is skipped,
+# a WARNING is emitted, and all other functionality continues unchanged.
+try:
+    from playwright_stealth import Stealth as _Stealth
+    _STEALTH_AVAILABLE = True
+except ImportError:
+    _Stealth = None  # type: ignore[assignment,misc]
+    _STEALTH_AVAILABLE = False
+
 # Canonical cookie path — imported by sources/linkedin.py and applier/linkedin_apply.py.
 # Both files previously defined their own COOKIES_PATH; this is the single source of truth.
 COOKIES_PATH = CONFIG_DIR / "linkedin_cookies.json"
@@ -51,6 +62,23 @@ async def linkedin_session(visible: bool = False):
         # A pinned Chrome 122 UA string creates a fingerprint mismatch with the
         # actual Chromium version shipped by playwright, which is a bot signal.
     )
+
+    # Phase 11.6 — apply stealth patches to the context so every page created
+    # from it inherits the patches via context.add_init_script(). This suppresses
+    # common browser fingerprinting signals: navigator.webdriver, missing plugins,
+    # HeadlessChrome UA substring, etc. Fails gracefully if the package is absent.
+    if _STEALTH_AVAILABLE:
+        try:
+            await _Stealth().apply_stealth_async(context)
+            log.debug("playwright-stealth patches applied to browser context")
+        except Exception as e:
+            log.warning(f"playwright-stealth patch failed (non-fatal): {e}")
+    else:
+        log.warning(
+            "playwright-stealth not installed — browser fingerprint not suppressed. "
+            "Install with: pip install playwright-stealth"
+        )
+
     try:
         if COOKIES_PATH.exists():
             try:

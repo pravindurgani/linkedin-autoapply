@@ -6,7 +6,7 @@ import logging
 import random
 import re
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 from playwright.async_api import async_playwright, Page, BrowserContext
 from auto_apply.config import HEADLESS, BROWSER_TIMEOUT, RATE_LIMIT_LINKEDIN
 from auto_apply.browser import COOKIES_PATH
@@ -34,6 +34,143 @@ _COMPANY_SELECTORS: list[str] = [
     "[class*='company-name']",                         # generic company-name class
     "[data-tracking-control-name*='company']",         # tracking attribute anchor
 ]
+
+# ── Description selector chain (detail-page only) ──
+# Priority-ordered for LinkedIn job detail pages. ID selectors are most stable;
+# class-based selectors degrade gracefully when LinkedIn DOM updates.
+# Add new confirmed selectors at the front when the LinkedIn layout changes.
+_DESCRIPTION_SELECTORS: list[str] = [
+    "#job-details",                                    # ID anchor — most stable
+    ".jobs-description-content__text",                 # content text class
+    ".jobs-description__content",                      # description content class
+    "[class*='jobs-description-content__text']",       # partial class match
+    "[class*='jobs-description__container']",          # container fallback
+]
+
+# ── Salary selector chain (card-level only) ──
+# LinkedIn card DOM sometimes exposes salary in a dedicated metadata element.
+# Priority-ordered; add new confirmed selectors at the front when the layout changes.
+# Falls back to all salary fields = None if no element matches — job is still stored.
+_SALARY_SELECTORS: list[str] = [
+    "[class*='job-card-container__salary-info']",      # dedicated salary metadata item
+    "[class*='job-card-list__salary-info']",           # list variant
+    "[class*='salary-info']",                          # generic salary-info class
+    "[class*='compensation']",                         # compensation class (rare)
+]
+
+# ── Easy Apply button selector chain (detail-page detection only) ──
+# Used by _scrape_description() to validate in-platform Easy Apply support (Phase 11.5).
+# Mirrors the applier's _EASY_APPLY_SELECTORS (applier/linkedin_apply.py) but is kept
+# local to avoid a cross-layer import. Ordered most stable → least stable.
+# Do NOT include external-apply selectors here — detection goal is presence of the
+# in-platform button, not any apply affordance.
+_EASY_APPLY_DETECT_SELECTORS: list[str] = [
+    '[aria-label*="Easy Apply"]',         # primary aria-label anchor
+    '[aria-label*="LinkedIn Apply"]',     # Apply Connect rebrand variant (2026)
+    "#jobs-apply-button-id",              # dedicated HTML ID — stable across label renames
+    "[data-live-test-job-apply-button]",  # test attribute — survives DOM restructuring
+]
+
+# ── Salary annualisation factors ──
+_HOURS_PER_YEAR: int = 1880   # 47 weeks × 40 h — standard UK annualisation
+_DAYS_PER_YEAR: int = 220     # Standard UK working days per year
+
+# ── Pay-period detection patterns ──
+_IS_HOURLY = re.compile(r'per\s+hour|/\s*(?:hr|hour)\b|hourly', re.IGNORECASE)
+_IS_DAILY = re.compile(r'per\s+day|/\s*day\b|daily', re.IGNORECASE)
+
+
+def _parse_salary(text: str) -> tuple[float | None, float | None, str | None]:
+    """Parse a raw salary string from a LinkedIn job card into structured fields.
+
+    Normalises the value to an annualised GBP range. Hourly rates are multiplied
+    by _HOURS_PER_YEAR (47 weeks × 40 h); daily rates by _DAYS_PER_YEAR (220 days).
+    Non-GBP currencies ($ €) and vague strings ("competitive", "DOE") are stored
+    as salary_text only — salary_min and salary_max are left None so the salary
+    filter treats them as unknown (pass-through, not rejected).
+
+    Args:
+        text: Raw salary string from the card element (e.g. "£80k - £100k/yr").
+
+    Returns:
+        Tuple (salary_min, salary_max, salary_text):
+          salary_min: Annualised lower bound (GBP float) or None.
+          salary_max: Annualised upper bound (GBP float) or None.
+          salary_text: Cleaned original text, or None if input was empty.
+    """
+    clean = text.strip()
+    if not clean:
+        return None, None, None
+
+    # No digits → vague string ("Competitive", "Negotiable", "DOE", "TBD", etc.)
+    if not re.search(r'\d', clean):
+        return None, None, clean
+
+    # Non-GBP currency only → store text, skip numeric parsing (can't compare to GBP threshold)
+    if re.search(r'[$€]', clean) and not re.search(r'£', clean):
+        return None, None, clean
+
+    # Detect pay period; also set per-unit plausible range to avoid misidentifying
+    # annual equivalents embedded in the same string (e.g. "£40/hr (£75,200/yr)").
+    if _IS_HOURLY.search(clean):
+        multiplier = float(_HOURS_PER_YEAR)
+        lo, hi = 5.0, 500.0           # plausible hourly rates in GBP
+    elif _IS_DAILY.search(clean):
+        multiplier = float(_DAYS_PER_YEAR)
+        lo, hi = 50.0, 5_000.0        # plausible daily rates in GBP
+    else:
+        multiplier = 1.0
+        lo, hi = 1_000.0, 2_000_000.0  # plausible annual salaries in GBP
+
+    # Extract numeric values — handles "80,000", "80k", "37.50"
+    nums: list[float] = []
+    for m in re.finditer(r'(\d[\d,]*(?:\.\d+)?)([kK])?', clean):
+        try:
+            val = float(m.group(1).replace(',', ''))
+            if m.group(2):
+                val *= 1_000.0
+            if lo <= val <= hi:
+                nums.append(val)
+        except ValueError:
+            continue
+
+    if not nums:
+        return None, None, clean
+
+    salary_min = nums[0] * multiplier
+    salary_max = nums[1] * multiplier if len(nums) >= 2 else None
+
+    # Final sanity check on annualised values
+    if salary_min > 2_000_000:
+        log.debug(f"Salary parse: implausible annualised value {salary_min:.0f} from {clean!r}")
+        return None, None, clean
+    if salary_max is not None and salary_max > 2_000_000:
+        salary_max = None
+
+    return salary_min, salary_max, clean
+
+
+def _canonical_url(url: str) -> str:
+    """Strip query parameters and fragment from a LinkedIn job URL.
+
+    LinkedIn card hrefs carry tracking parameters (refId, trackingId, trk, midToken,
+    etc.) that differ across sessions and search contexts. Removing them produces a
+    stable URL for storage and reports. Deduplication itself uses the (source,
+    external_id) unique constraint and is unaffected by this normalisation.
+
+    Args:
+        url: Raw LinkedIn URL, possibly with query string and fragment.
+
+    Returns:
+        URL with scheme, host, and path only. Returns url unchanged on parse error.
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+    except Exception:
+        return url
 
 
 def configure(email: str, password: str, visible: bool = False) -> None:
@@ -174,9 +311,16 @@ class LinkedInSource(BaseJobSource):
                            min_salary: int) -> list[Job]:
         jobs = []
 
-        # LinkedIn salary filter: f_SB2 parameter (6 = £80k+, 7 = £100k+)
-        # We use 6 (£80k+) to cast a slightly wider net, then filter in post
-        salary_filter = "6"  # £80,000+
+        # Dynamic LinkedIn salary filter (Step 8.6 / Phase 11.3).
+        # f_SB2 maps min_salary to LinkedIn's server-side filter: 7 = £100k+, 6 = £80k+.
+        # Omitted entirely below £80k — Python-side _salary_passes_filter() handles
+        # post-scrape filtering once salary_min/salary_max are populated by _parse_card().
+        if min_salary >= 100_000:
+            _sb2_param = "&f_SB2=7"
+        elif min_salary >= 80_000:
+            _sb2_param = "&f_SB2=6"
+        else:
+            _sb2_param = ""
 
         for page_num in range(MAX_PAGES):
             start = page_num * 25
@@ -184,7 +328,7 @@ class LinkedInSource(BaseJobSource):
                 f"https://www.linkedin.com/jobs/search/"
                 f"?keywords={quote(keywords)}"
                 f"&location={location}"
-                f"&f_SB2={salary_filter}"
+                f"{_sb2_param}"
                 f"&f_WT=2"  # On-site and hybrid
                 f"&f_JT=F"  # Full-time
                 f"&f_AL=true"  # Easy Apply only
@@ -200,6 +344,8 @@ class LinkedInSource(BaseJobSource):
             if not cards:
                 log.debug(f"LinkedIn: no cards on page {page_num + 1} for '{keywords}'")
                 break
+
+            page_start = len(jobs)  # Phase 11.1: track start index for this page's jobs
 
             for card in cards:
                 try:
@@ -218,6 +364,24 @@ class LinkedInSource(BaseJobSource):
                     f"for '{keywords}' had unknown company "
                     f"— company selector chain may need updating (see Step 10.3)"
                 )
+
+            # Phase 11.1 — Detail-page description scraping.
+            # Card element handles are no longer needed at this point.
+            # Failures are soft: a job without a description is still stored
+            # and scored on title + company only.
+            page_jobs = jobs[page_start:]
+            if page_jobs:
+                log.info(
+                    f"Fetching descriptions: {len(page_jobs)} jobs "
+                    f"('{keywords}' page {page_num + 1})"
+                )
+                desc_count = 0
+                for job in page_jobs:
+                    job.description, job.easy_apply = await self._scrape_description(page, job.url)
+                    if job.description:
+                        desc_count += 1
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
+                log.info(f"  Descriptions fetched: {desc_count}/{len(page_jobs)}")
 
             await asyncio.sleep(RATE_LIMIT_LINKEDIN)
 
@@ -272,24 +436,114 @@ class LinkedInSource(BaseJobSource):
         loc_el = await card.query_selector('.job-card-container__metadata-item, [class*="location"]')
         location = (await loc_el.inner_text()).strip() if loc_el else "London"
 
-        # NOTE: Job description is not extracted at card-scrape time.
-        # LinkedIn list pages do not expose full descriptions in card DOM.
-        # Fetching descriptions requires a separate page.goto() per job (detail-page scrape).
-        # See Step 9.4 architectural note in IMPLEMENTATION_PLAN.md for the session-reuse
-        # prerequisite that makes detail-page scraping practical.
-        # Scores are currently based on title + company only (description="", salary_text=None).
+        # Salary — try each selector; all fields remain None if no element matches.
+        # None is the correct fallback: jobs without card-level salary still flow
+        # through _salary_passes_filter() as pass-through (not rejected).
+        salary_min: float | None = None
+        salary_max: float | None = None
+        salary_text: str | None = None
+        for _sel in _SALARY_SELECTORS:
+            _el = await card.query_selector(_sel)
+            if _el:
+                _raw = (await _el.inner_text()).strip().split("\n")[0].strip()
+                if _raw:
+                    salary_min, salary_max, salary_text = _parse_salary(_raw)
+                    log.debug(
+                        f"Salary '{title[:40]}': {salary_text!r} "
+                        f"→ min={salary_min}, max={salary_max}"
+                    )
+                    break
 
-        easy_apply = True  # f_AL=true URL filter guarantees all results are Easy Apply
+        # description and easy_apply are populated by _scrape_description() in
+        # _search_term() after all cards on a page are parsed — not here.
+        # easy_apply=True is the initial default (f_AL=true in the search URL ensures
+        # all listed results are Easy Apply); _scrape_description() will override it
+        # with the confirmed button-presence result from the detail page (Phase 11.5).
+
+        easy_apply = True
 
         if not title:
             return None
+
+        # Phase 11.4 — strip tracking/UTM parameters from the URL before storage.
+        url = _canonical_url(url)
 
         return Job(
             title=title,
             company=company,
             location=location,
+            salary_min=salary_min,
+            salary_max=salary_max,
+            salary_text=salary_text,
             url=url,
             source=JobSource.LINKEDIN,
             external_id=external_id,
             easy_apply=easy_apply,
         )
+
+    async def _scrape_description(self, page: Page, url: str) -> tuple[str, bool]:
+        """Fetch the full description and Easy Apply status from a LinkedIn job detail page.
+
+        Navigates to url and extracts both the description text and the presence of the
+        Easy Apply button (Phase 11.5). easy_apply is set to False only on a confirmed
+        successful page load where no Easy Apply button is found — any failure preserves
+        the default (True) so jobs are never incorrectly blocked by a transient error.
+        Rate limiting between calls is the caller's responsibility.
+
+        Args:
+            page: Playwright Page to navigate — shared with card scraping.
+            url: LinkedIn job detail URL (https://www.linkedin.com/jobs/view/<id>/).
+
+        Returns:
+            Tuple (description, easy_apply):
+              description: Extracted description text, or "" if unavailable.
+              easy_apply: True if the Easy Apply button is present, or True if the
+                          page could not be loaded (preserves scrape default — only
+                          False on a confirmed successful load with no button found).
+        """
+        if not url:
+            return "", True
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+            await asyncio.sleep(random.uniform(1, 2))
+
+            # Auth redirect — session expired or listing gated behind login.
+            # Can't determine Easy Apply status; preserve default.
+            current_url = page.url
+            if any(kw in current_url for kw in ("login", "authwall", "checkpoint", "challenge")):
+                log.warning(
+                    f"Description scrape: auth redirect to {current_url!r} "
+                    f"for {url[:80]} — session may have expired"
+                )
+                return "", True
+
+            # Phase 11.5 — Easy Apply button detection.
+            # Run before description extraction so we check the same loaded page.
+            # easy_apply=False only when we are confident: page loaded, no button found.
+            easy_apply = False
+            for sel in _EASY_APPLY_DETECT_SELECTORS:
+                if await page.query_selector(sel):
+                    easy_apply = True
+                    break
+            if not easy_apply:
+                log.debug(f"Easy Apply button absent for {url[:80]} — easy_apply=False")
+
+            # Description extraction
+            description = ""
+            for sel in _DESCRIPTION_SELECTORS:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        log.debug(f"Description: {len(text)} chars via '{sel}' for {url[:80]}")
+                        description = text
+                        break
+
+            if not description:
+                log.debug(f"Description: no element matched for {url[:80]}")
+
+            return description, easy_apply
+
+        except Exception as e:
+            log.warning(f"Description scrape failed for {url[:80]}: {e}")
+            return "", True

@@ -145,7 +145,7 @@ def _run_wizard_prompts() -> dict:
     print()
 
     # Step 1: Claude API key
-    print("Step 1/7: Claude API key")
+    print("Step 1/8: Claude API key")
     print("  Get yours at: https://console.anthropic.com")
     while True:
         api_key = getpass.getpass("  API key (sk-ant-...): ").strip()
@@ -157,7 +157,7 @@ def _run_wizard_prompts() -> dict:
         print(f" FAILED\n  {err}")
 
     # Step 2: LinkedIn email
-    print("\nStep 2/7: LinkedIn account email")
+    print("\nStep 2/8: LinkedIn account email")
     while True:
         linkedin_email = input("  LinkedIn email: ").strip()
         if _validate_email(linkedin_email):
@@ -165,7 +165,7 @@ def _run_wizard_prompts() -> dict:
         print("  Invalid email format.")
 
     # Step 3: LinkedIn password (stored in keyring, not config)
-    print("\nStep 3/7: LinkedIn password")
+    print("\nStep 3/8: LinkedIn password")
     while True:
         linkedin_password = getpass.getpass("  LinkedIn password: ")
         if linkedin_password:
@@ -180,7 +180,7 @@ def _run_wizard_prompts() -> dict:
         )
 
     # Step 4: Job titles
-    print("\nStep 4/7: Job titles to search for")
+    print("\nStep 4/8: Job titles to search for")
     print("  Enter one per line. Empty line when done.")
     job_titles: list[str] = []
     while True:
@@ -193,11 +193,11 @@ def _run_wizard_prompts() -> dict:
             job_titles.append(title)
 
     # Step 5: Location
-    print("\nStep 5/7: Location")
+    print("\nStep 5/8: Location")
     location = input("  Location (e.g. London, UK) [London]: ").strip() or "London"
 
     # Step 6: Minimum salary
-    print("\nStep 6/7: Minimum annual salary (GBP)")
+    print("\nStep 6/8: Minimum annual salary (GBP)")
     while True:
         salary_str = input("  Min salary (e.g. 90000): ").strip().replace(",", "").replace("£", "")
         try:
@@ -209,7 +209,7 @@ def _run_wizard_prompts() -> dict:
             print("  Enter a number, e.g. 90000")
 
     # Step 7: CV path + applicant info
-    print("\nStep 7/7: CV and contact details")
+    print("\nStep 7/8: CV and contact details")
     while True:
         cv_path = input("  Path to your CV PDF: ").strip()
         valid, err = _validate_cv_path(cv_path)
@@ -231,6 +231,52 @@ def _run_wizard_prompts() -> dict:
 
     applicant_phone = input("  Phone number (e.g. +447000000000): ").strip()
 
+    # Step 8: Visa & Work Authorisation
+    print("\nStep 8/8: Visa & Work Authorisation")
+    while True:
+        rtw = input("  Do you have the right to work in your target country? [y/n]: ").strip().lower()
+        if rtw in ("y", "yes", "n", "no"):
+            break
+        print("  Please enter y or n.")
+
+    requires_sponsorship: bool
+    work_authorisation: str
+    visa_notes: str = ""
+
+    if rtw in ("y", "yes"):
+        print("  What is your authorisation type?")
+        print("    [1] Citizen / permanent resident")
+        print("    [2] Pre-settled / settled status (EU Settlement Scheme)")
+        print("    [3] Valid work visa (no sponsorship needed)")
+        print("    [4] Other")
+        while True:
+            auth_choice = input("  Select [1-4]: ").strip()
+            if auth_choice in ("1", "2", "3", "4"):
+                break
+            print("  Please enter 1, 2, 3, or 4.")
+        _AUTH_KEYS = {"1": "citizen", "2": "pre_settled", "3": "valid_visa", "4": "other"}
+        work_authorisation = _AUTH_KEYS[auth_choice]
+        requires_sponsorship = False
+        if work_authorisation in ("valid_visa", "other"):
+            visa_notes = input(
+                "  Any notes about your visa? (e.g. limited to 20 hrs/week): "
+            ).strip()
+    else:
+        print("  What type of sponsorship do you need?")
+        print("    [1] Skilled Worker visa (UK)")
+        print("    [2] Other visa type")
+        while True:
+            spons_choice = input("  Select [1-2]: ").strip()
+            if spons_choice in ("1", "2"):
+                break
+            print("  Please enter 1 or 2.")
+        work_authorisation = "skilled_worker_uk" if spons_choice == "1" else "other"
+        requires_sponsorship = True
+        if work_authorisation == "other":
+            visa_notes = input(
+                "  Any notes about your visa requirements? "
+            ).strip()
+
     config = {
         "claude_api_key": api_key,
         "linkedin_email": linkedin_email,
@@ -241,6 +287,9 @@ def _run_wizard_prompts() -> dict:
         "applicant_name": applicant_name,
         "applicant_email": applicant_email,
         "applicant_phone": applicant_phone,
+        "requires_sponsorship": requires_sponsorship,
+        "work_authorisation": work_authorisation,
+        "visa_notes": visa_notes,
         # Title filters — edit ~/.linkedin_autoapply/config.json to customise
         "title_must_contain": TITLE_MUST_CONTAIN,
         "title_exclude": TITLE_EXCLUDE,
@@ -259,6 +308,16 @@ def _run_wizard_prompts() -> dict:
     print(f"  Name:            {applicant_name}")
     print(f"  Contact email:   {applicant_email}")
     print(f"  Phone:           {applicant_phone or '(not set)'}")
+    _VISA_DISPLAY = {
+        "citizen": "Not required (Citizen / permanent resident)",
+        "pre_settled": "Not required (Pre-settled / settled status)",
+        "valid_visa": "Not required (Valid work visa)",
+        "skilled_worker_uk": "Required (Skilled Worker visa, UK)",
+        "other": ("Required" if requires_sponsorship else "Not required") + " (Other)",
+    }
+    print(f"  Sponsorship:     {_VISA_DISPLAY.get(work_authorisation, work_authorisation)}")
+    if visa_notes:
+        print(f"  Visa notes:      {visa_notes}")
     print(f"  Password:        stored in system keyring")
     print("=" * 60)
 

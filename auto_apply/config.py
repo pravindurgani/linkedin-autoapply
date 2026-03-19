@@ -46,6 +46,18 @@ CLAUDE_MODEL_CV_REVIEW = "claude-sonnet-4-6"
 HEADLESS = True  # Set False to debug browser interactions
 BROWSER_TIMEOUT = 30_000  # ms
 
+# ── Phase 11.7 — Account safety rate limiting ──
+# These are system defaults; override via config.json keys of the same name.
+# max_daily_applications: hard cap — refuse to apply once reached for today
+# max_session_minutes: soft cap — skip apply phase if session has run too long
+# business_hours_only: if true, skip apply phase outside the configured window
+# business_hours_start / end: 24-hour local time (inclusive start, exclusive end)
+MAX_DAILY_APPLICATIONS: int = 15
+MAX_SESSION_MINUTES: int = 120
+APPLY_BUSINESS_HOURS_ONLY: bool = False
+APPLY_BUSINESS_HOURS_START: int = 9   # 09:00 local time
+APPLY_BUSINESS_HOURS_END: int = 18    # 18:00 local time
+
 
 def load_config() -> dict:
     """Load user config from CONFIG_PATH. Returns empty dict if not found."""

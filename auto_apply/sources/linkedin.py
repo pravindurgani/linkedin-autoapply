@@ -36,15 +36,17 @@ _COMPANY_SELECTORS: list[str] = [
 ]
 
 # ── Description selector chain (detail-page only) ──
-# Priority-ordered for LinkedIn job detail pages. ID selectors are most stable;
-# class-based selectors degrade gracefully when LinkedIn DOM updates.
+# Priority-ordered for LinkedIn job detail pages. data-testid is most stable
+# (LinkedIn's own test infra); semantic IDs/classes are legacy fallbacks.
+# As of 2026-03, LinkedIn replaced all semantic CSS classes with obfuscated hashes.
 # Add new confirmed selectors at the front when the LinkedIn layout changes.
 _DESCRIPTION_SELECTORS: list[str] = [
-    "#job-details",                                    # ID anchor — most stable
-    ".jobs-description-content__text",                 # content text class
-    ".jobs-description__content",                      # description content class
-    "[class*='jobs-description-content__text']",       # partial class match
-    "[class*='jobs-description__container']",          # container fallback
+    '[data-testid="expandable-text-box"]',             # 2026-03 DOM — stable test anchor
+    "#job-details",                                    # legacy ID anchor
+    ".jobs-description-content__text",                 # legacy content text class
+    ".jobs-description__content",                      # legacy description content class
+    "[class*='jobs-description-content__text']",       # legacy partial class match
+    "[class*='jobs-description__container']",          # legacy container fallback
 ]
 
 # ── Salary selector chain (card-level only) ──

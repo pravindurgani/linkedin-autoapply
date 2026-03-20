@@ -8,6 +8,7 @@ across navigations — the tokens LinkedIn requires for full authentication.
 
 import json
 import logging
+import random
 from contextlib import asynccontextmanager
 
 from playwright.async_api import async_playwright, BrowserContext
@@ -57,7 +58,7 @@ async def linkedin_session(visible: bool = False):
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(headless=not visible)
     context = await browser.new_context(
-        viewport={"width": 1280, "height": 800},
+        viewport={"width": random.randint(1260, 1420), "height": random.randint(780, 900)},
         # No hardcoded user_agent — use Playwright's current Chromium default.
         # A pinned Chrome 122 UA string creates a fingerprint mismatch with the
         # actual Chromium version shipped by playwright, which is a bot signal.

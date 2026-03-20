@@ -250,7 +250,7 @@ class LinkedInSource(BaseJobSource):
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=_headless)
                 ctx = await browser.new_context(
-                    viewport={"width": 1280, "height": 800},
+                    viewport={"width": random.randint(1260, 1420), "height": random.randint(780, 900)},
                     # No hardcoded user_agent — use Playwright's current Chromium default.
                 )
                 page = await ctx.new_page()
@@ -282,7 +282,7 @@ class LinkedInSource(BaseJobSource):
                 cookies = json.loads(COOKIES_PATH.read_text())
                 await context.add_cookies(cookies)
                 await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
-                await asyncio.sleep(2)
+                await asyncio.sleep(random.uniform(1.4, 2.6))
                 if "feed" in page.url:
                     log.info("LinkedIn: restored session from cookies")
                     return
@@ -292,12 +292,14 @@ class LinkedInSource(BaseJobSource):
         # Fresh login
         log.info("LinkedIn: logging in...")
         await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
-        await asyncio.sleep(1)
+        await asyncio.sleep(random.uniform(0.7, 1.3))
 
-        await page.fill('#username', _linkedin_email)
-        await page.fill('#password', _linkedin_password)
+        await page.fill('#username', '')  # Clear any autofilled content
+        await page.type('#username', _linkedin_email, delay=random.randint(60, 120))
+        await page.fill('#password', '')
+        await page.type('#password', _linkedin_password, delay=random.randint(60, 120))
         await page.click('button[type="submit"]')
-        await asyncio.sleep(3)
+        await asyncio.sleep(random.uniform(2.1, 3.9))
 
         # Check for verification challenge
         if "checkpoint" in page.url or "challenge" in page.url:
@@ -339,7 +341,7 @@ class LinkedInSource(BaseJobSource):
             )
 
             await page.goto(url, wait_until="domcontentloaded")
-            await asyncio.sleep(3)
+            await asyncio.sleep(random.uniform(2.1, 3.9))
 
             # Parse job cards from the list
             cards = await page.query_selector_all('.job-card-container, .jobs-search-results__list-item')
@@ -543,6 +545,16 @@ class LinkedInSource(BaseJobSource):
 
             if not description:
                 log.debug(f"Description: no element matched for {url[:80]}")
+
+            # Simulate reading the page before moving on
+            word_count = len(description.split())
+            reading_seconds = min(8.0, word_count / 200)  # ~200 wpm, capped at 8s
+            reading_delay = reading_seconds * random.uniform(0.5, 1.0)
+
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 0.4)")
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 0.4)")
+            await asyncio.sleep(reading_delay)
 
             return description, easy_apply
 

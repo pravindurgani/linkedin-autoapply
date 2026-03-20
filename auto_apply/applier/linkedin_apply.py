@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 from datetime import datetime
 from pathlib import Path
@@ -533,6 +534,21 @@ def answer_question(question: str, options: list[str] | None = None,
     return _ask_claude(question, options, job_title, field_type)
 
 
+async def _human_click(page, el, jitter: int = 5) -> None:
+    """Move mouse to element with coordinate jitter before clicking."""
+    try:
+        box = await el.bounding_box()
+        if box:
+            x = box["x"] + box["width"] / 2 + random.randint(-jitter, jitter)
+            y = box["y"] + box["height"] / 2 + random.randint(-jitter, jitter)
+            await page.mouse.move(x, y, steps=random.randint(5, 12))
+            await el.click()
+        else:
+            await el.click()
+    except Exception:
+        await el.click()
+
+
 class LinkedInApplier(BaseApplier):
     name = "linkedin"
 
@@ -638,7 +654,7 @@ class LinkedInApplier(BaseApplier):
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=_headless)
                 ctx = await browser.new_context(
-                    viewport={"width": 1280, "height": 800},
+                    viewport={"width": random.randint(1260, 1420), "height": random.randint(780, 900)},
                 )
                 page = await ctx.new_page()
                 page.set_default_timeout(BROWSER_TIMEOUT)
@@ -759,7 +775,7 @@ class LinkedInApplier(BaseApplier):
             for sel in _EASY_APPLY_SELECTORS:
                 el = await page.query_selector(sel)
                 if el:
-                    await el.click()
+                    await _human_click(page, el)
                     break
             else:
                 screenshot_path, failure_url = await self._capture_diagnostics(
@@ -767,7 +783,7 @@ class LinkedInApplier(BaseApplier):
                 )
                 return False, "Easy Apply button found by wait but click failed", screenshot_path, failure_url
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(random.uniform(2.1, 3.9))
 
         success = await self._fill_modal(page, job_title)
         if success:
@@ -780,11 +796,13 @@ class LinkedInApplier(BaseApplier):
     async def _login(self, page: Page):
         log.info("LinkedIn: logging in for apply...")
         await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
-        await asyncio.sleep(1)
-        await page.fill('#username', _linkedin_email)
-        await page.fill('#password', _linkedin_password)
+        await asyncio.sleep(random.uniform(0.7, 1.3))
+        await page.fill('#username', '')  # Clear any autofilled content
+        await page.type('#username', _linkedin_email, delay=random.randint(60, 120))
+        await page.fill('#password', '')
+        await page.type('#password', _linkedin_password, delay=random.randint(60, 120))
         await page.click('button[type="submit"]')
-        await asyncio.sleep(3)
+        await asyncio.sleep(random.uniform(2.1, 3.9))
 
     async def _fill_modal(self, page: Page, job_title: str) -> bool:
         """Fill LinkedIn Easy Apply modal step by step. Returns True if submitted."""
@@ -793,7 +811,7 @@ class LinkedInApplier(BaseApplier):
         stuck_count = 0
 
         for step in range(max_steps):
-            await asyncio.sleep(2)
+            await asyncio.sleep(random.uniform(1.4, 2.6))
 
             # Extract all form fields with their question labels
             fields = await self._extract_fields(page)
@@ -812,6 +830,7 @@ class LinkedInApplier(BaseApplier):
 
             # Fill each field
             for field in fields:
+                await asyncio.sleep(random.uniform(0.3, 1.0))
                 await self._fill_field(page, field, job_title)
 
             # Upload CV if file input present
@@ -826,7 +845,7 @@ class LinkedInApplier(BaseApplier):
                     file_input = await page.query_selector('div[role="dialog"] input[type="file"]')
                     if file_input:
                         await file_input.set_input_files(_cv_path)
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(random.uniform(0.7, 1.3))
                 except Exception as e:
                     log.warning(f"CV upload failed: {e}")
 
@@ -844,7 +863,7 @@ class LinkedInApplier(BaseApplier):
 
             if action == "submit":
                 await self._click_footer_primary(page)
-                await asyncio.sleep(3)
+                await asyncio.sleep(random.uniform(2.1, 3.9))
                 if await self._check_success(page):
                     log.info("LinkedIn Easy Apply submitted successfully")
                     return True
@@ -1022,8 +1041,8 @@ class LinkedInApplier(BaseApplier):
                             # Type slowly to trigger autocomplete
                             await el.click()
                             await el.fill("")
-                            await el.type(answer.split(",")[0], delay=50)  # Just "London"
-                            await asyncio.sleep(1.5)
+                            await el.type(answer.split(",")[0], delay=random.randint(40, 80))  # Just "London"
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
                             # Select first autocomplete option
                             option = await page.query_selector(
                                 '[role="listbox"] [role="option"], '
@@ -1031,14 +1050,18 @@ class LinkedInApplier(BaseApplier):
                                 '[class*="typeahead"] [role="option"]'
                             )
                             if option:
-                                await option.click()
-                                await asyncio.sleep(0.5)
+                                await _human_click(page, option)
+                                await asyncio.sleep(random.uniform(0.3, 0.7))
                             else:
                                 await el.press("Enter")
-                                await asyncio.sleep(0.3)
+                                await asyncio.sleep(random.uniform(0.2, 0.4))
                         else:
-                            await el.fill(answer)
-                            await asyncio.sleep(0.3)
+                            if len(answer) <= 80:
+                                await el.fill("")  # Clear any autofilled content before typing
+                                await el.type(answer, delay=random.randint(30, 70))
+                            else:
+                                await el.fill(answer)
+                            await asyncio.sleep(random.uniform(0.2, 0.4))
                         log.debug(f"  Filled '{question[:50]}' → {answer}")
                 except Exception as e:
                     log.debug(f"  Failed to fill '{question[:50]}': {e}")
@@ -1118,15 +1141,21 @@ class LinkedInApplier(BaseApplier):
         }''')
 
     async def _click_footer_primary(self, page: Page):
-        """Click the primary button in the dialog footer via JS."""
-        await page.evaluate('''() => {
-            const dialog = document.querySelector('div[role="dialog"]');
-            if (!dialog) return;
-            const footer = dialog.querySelector('footer');
-            if (!footer) return;
-            const btn = footer.querySelector('button[class*="artdeco-button--primary"]');
-            if (btn) btn.click();
-        }''')
+        """Click the primary button in the dialog footer."""
+        btn = await page.query_selector(
+            'div[role="dialog"] footer button[class*="artdeco-button--primary"]'
+        )
+        if btn:
+            await _human_click(page, btn)
+        else:
+            await page.evaluate('''() => {
+                const dialog = document.querySelector('div[role="dialog"]');
+                if (!dialog) return;
+                const footer = dialog.querySelector('footer');
+                if (!footer) return;
+                const btn = footer.querySelector('button[class*="artdeco-button--primary"]');
+                if (btn) btn.click();
+            }''')
 
     async def _check_success(self, page: Page) -> bool:
         """Check if the application was submitted successfully."""

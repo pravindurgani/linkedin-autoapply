@@ -252,3 +252,17 @@ Run the test suite to confirm everything is working:
 pip install -e ".[dev]"
 pytest
 ```
+
+## Anti-Detection & Human Behaviour Hardening
+
+The tool includes several measures to reduce automated-browsing detection signals:
+
+- **Viewport randomisation** — each session uses a randomised browser viewport (1260–1420 x 780–900) instead of a fixed resolution, reducing fingerprint consistency.
+- **Humanised timing** — all fixed `sleep()` delays are replaced with ±30% jitter ranges (`random.uniform`), producing non-repeating, non-integer intervals between actions.
+- **Mouse movement simulation** — before clicking buttons (Easy Apply, form navigation, autocomplete options), the mouse moves to the element with coordinate jitter and a realistic multi-step trajectory.
+- **Scroll and reading delay** — on job detail pages, the browser scrolls in two steps with pauses proportional to the description length (~200 wpm reading speed, capped at 8 seconds).
+- **Character-by-character typing** — login credentials and short form answers are typed with per-keystroke delays (30–120ms) rather than instant `fill()`, matching human typing patterns.
+- **Micro-pauses between form fields** — a short random delay (0.3–1.0s) is inserted before each field interaction to simulate reading the question.
+- **Stealth browser patches** — `playwright-stealth` suppresses common headless-browser fingerprints (`navigator.webdriver`, missing plugins, HeadlessChrome UA substring).
+
+These measures operate inline with no additional configuration, dependencies beyond `playwright-stealth`, or config keys.
